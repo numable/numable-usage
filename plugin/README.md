@@ -12,7 +12,7 @@
 ```
 
 跑完一次会话后，在 Claude Code 里运行 `/numable-usage` 取出**读取令牌**，
-粘贴到 Numable 的「我的 → 凭证」里，再在商店安装「Claude Code 用量」信息源即可。
+粘贴到 Numable 的「我的 → 凭证」里，再在商店安装「Claude Code 用量」工具即可。
 
 ## 它上传什么
 
