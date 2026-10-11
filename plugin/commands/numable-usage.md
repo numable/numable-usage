@@ -19,8 +19,10 @@ description: 查看 Numable 用量小组件的接入状态、取出接入所需�
   一次只删用户点名的那一个；不要替用户挑，也不要因为输出里建议了就自己去删 —— 删除不可撤销。
 
 - 「实时会话 / 现在在跑什么 / 哪个在等我」→ 运行 `node "${CLAUDE_PLUGIN_ROOT}/scripts/live.cjs" --sessions`
-- 「打开 / 关闭实时会话」→ 运行 `node "${CLAUDE_PLUGIN_ROOT}/scripts/live.cjs" --live on`(或 `off`);不带参数看现状
-  (目前只记在本机、不上传;打开前可以把这一点告诉用户)
+- 「打开 / 关闭实时会话」「同步到手机」→ 运行 `node "${CLAUDE_PLUGIN_ROOT}/scripts/live.cjs" --live sync on`(打开并同步)
+  或 `--live off`(全关)、`--live sync off`(只关同步、本机照记);不带参数 `--live` 看现状。
+  0.10.0 起新装默认已打开并同步(只传匿名会话号、状态、时长、token、工具类目,没有项目名、标题、提示词);
+  用户也可以在 App 的「实时」页点「在电脑上打开」,下一次采集时自动生效
 - 「会话标题 / 上传标题 / 回顾里显示标题」→ 运行 `node "${CLAUDE_PLUGIN_ROOT}/scripts/live.cjs" --titles`(看现状);用户明确要打开才 `--titles on`,要关 `--titles off`(打开会上传会话标题,先告诉用户这一点)
 - 「状态栏怎么配」→ 告诉用户在 `~/.claude/settings.json` 加
   `"statusLine": {"type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/live.cjs\" --statusline"}`,

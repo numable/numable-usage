@@ -13,7 +13,8 @@
  *   POST /claim   { code }          → { readToken }
  *   GET  /s       Bearer<read>      → { updatedAt, merged, sources }   ?today=YYYY-MM-DD 以看的人那天为锚
  *   POST /live    Bearer<write>     ?dev=<设备>  实时会话(整份覆盖本设备行)  → { ok }
- *   GET  /live    Bearer<read>      → { now, updatedAt, count, devices, sessions }   见 live.js
+ *   GET  /live    Bearer<read>      → { now, updatedAt, count, devices, sessions, req }   见 live.js
+ *   POST /live/enable Bearer<read>  手机请求电脑打开实时会话(L1)  → { ok, at };电脑下次 /ingest 回包带 liveReq
  *   GET  /health
  */
 
@@ -968,7 +969,7 @@ async function handle(req, env, ctx) {
   if (p === '/ingest' && req.method === 'POST') {
     const spaceId = await verifyToken(env, 'w', bearer(req));
     if (!spaceId) return err('unauthorized', 401);
-    const space = await env.DB.prepare('SELECT space_id FROM spaces WHERE space_id = ?1')
+    const space = await env.DB.prepare('SELECT space_id, live_req_at FROM spaces WHERE space_id = ?1')
       .bind(spaceId).first();
     if (!space) return err('unauthorized', 401);
     if (!(await allow(env, `ing:${spaceId}`, 10))) return err('rate_limited', 429);
@@ -1001,7 +1002,8 @@ async function handle(req, env, ctx) {
       env.DB.prepare('UPDATE spaces SET last_push_at = ?2 WHERE space_id = ?1')
         .bind(space.space_id, now),
     ]);
-    return json({ ok: true, days: clean.days.length });
+    // 手机上请求过打开实时会话 → 带回那一刻;插件 0.10.0+ 每个请求只认一次(老插件不认这个键)
+    return json(space.live_req_at ? { ok: true, days: clean.days.length, liveReq: space.live_req_at } : { ok: true, days: clean.days.length });
   }
 
   // ---- 忘记一个设备 ----
@@ -1087,6 +1089,22 @@ async function handle(req, env, ctx) {
     const raw = await req.text();
     if (raw.length > 4096) return err('payload_too_large', 413);
     return stub.fetch('https://live/notify', { method: 'POST', body: raw, headers: { 'content-type': 'application/json' } });
+  }
+
+  // 手机请求「在电脑上打开实时会话」(读令牌:手机只有它)。只记一个时刻,电脑下一次 /ingest 时取走;
+  // 同时告诉实时空间,好让页面显示「已请求,等电脑」。只能打开 L1,不能打开项目名 / 标题。
+  if (p === '/live/enable' && req.method === 'POST') {
+    const spaceId = await verifyToken(env, 'r', bearer(req));
+    if (!spaceId) return err('unauthorized', 401);
+    if (!(await allow(env, `len:${spaceId}`, 5))) return err('rate_limited', 429);
+    const at = Date.now();
+    const upd = await env.DB.prepare('UPDATE spaces SET live_req_at = ?2 WHERE space_id = ?1').bind(spaceId, at).run();
+    if (upd.meta && upd.meta.changes === 0) return err('unauthorized', 401);
+    if (env.LIVE) {
+      const stub = env.LIVE.get(env.LIVE.idFromName(spaceId));
+      await stub.fetch('https://live/req', { method: 'POST', body: JSON.stringify({ at }), headers: { 'content-type': 'application/json' } });
+    }
+    return json({ ok: true, at });
   }
 
   if (p === '/live' && (req.method === 'POST' || req.method === 'GET')) {

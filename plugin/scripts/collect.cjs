@@ -839,6 +839,9 @@ async function cmdStatus() {
   console.log('还有别的电脑也在用 Claude Code？--link 生成加入串，让它们合并到同一个空间。');
   console.log('数字比实际偏大？--devices 看看有没有这台电脑改名前留下的旧记录。');
   console.log(`按项目：${cfg.projectNames === true ? '上传文件夹名' : '只传匿名编号'}（--projects on|off）`);
+  const liveSync = cfg.live === true && cfg.liveSync === true;
+  console.log(`实时会话：${liveSync ? '已打开并同步到手机' : cfg.live === true ? '只在本机记录，未同步' : '未打开'}`
+    + `${liveSync && cfg.liveBy === 'phone' ? '（在手机上打开的）' : ''}（live.cjs --live on|off、--live sync on|off；也可以在 App 的「实时」页打开）`);
 }
 
 /**
@@ -983,8 +986,11 @@ async function cmdJoin(code) {
     if (old.spaceId && old.writeToken) {
       try { await post('/forget', { source: 'claude-code', device }, old.writeToken); } catch { /* 忽略 */ }
     }
+    // 本机的开关(实时会话 / 同步 / 项目名 / 标题)跟着这台电脑走,换空间不重置
+    const keep = {};
+    for (const k of ['live', 'liveSync', 'liveBy', 'liveOffAt', 'projectNames', 'titles']) if (old[k] !== undefined) keep[k] = old[k];
     writeJson(CONFIG, {
-      endpoint, spaceId: o.s, writeToken: o.w, readToken: o.r, device,
+      endpoint, spaceId: o.s, writeToken: o.w, readToken: o.r, device, ...keep,
       createdAt: old.createdAt || new Date().toISOString(), joinedAt: new Date().toISOString(),
     });
     await collectAndPush({ force: true });
@@ -1053,6 +1059,9 @@ async function collectAndPush({ force = false } = {}) {
       writeToken: r.json.writeToken,
       readToken: r.json.readToken,
       createdAt: new Date().toISOString(),
+      // 0.10.0 起新装默认打开实时会话(L1:匿名序号、状态、时长、token、工具类目)并同步到手机;
+      // 项目名 / 会话标题仍默认关。老用户(config 早已存在、没有 live 键)不在这里,保持原样。
+      live: true, liveSync: true, liveBy: 'default',
     };
     writeJson(CONFIG, cfg);
     printOnboarding();
@@ -1087,6 +1096,27 @@ async function collectAndPush({ force = false } = {}) {
   const r = await post('/ingest', payload, cfg.writeToken);
   if (!r.ok) { log('ingest failed', r.status, r.text); return; }
   log('pushed', payload.snapshot.days.length, 'days');
+  applyLiveRequest(r.json && r.json.liveReq);
+}
+
+/**
+ * 手机上点了「在电脑上打开实时会话」→ 服务端在 /ingest 回包里带回那一刻(liveReq)。
+ * 每个请求只认一次(liveReqSeen);本机之后用 --live off 关掉的,只有手机上再点一次(更新的时刻)才会重新打开。
+ * 只开 L1(实时 + 同步),不碰项目名 / 标题开关。
+ */
+function applyLiveRequest(rq) {
+  rq = Number(rq);
+  if (!Number.isFinite(rq) || rq <= 0) return false;
+  const cur = readJson(CONFIG, null);                  // 重读:live.cjs 可能刚写过
+  if (!cur || rq <= (Number(cur.liveReqSeen) || 0)) return false;
+  cur.liveReqSeen = rq;
+  let on = false;
+  if (!(cur.live === true && cur.liveSync === true) && rq > (Number(cur.liveOffAt) || 0)) {
+    cur.live = true; cur.liveSync = true; cur.liveBy = 'phone'; on = true;
+  }
+  writeJson(CONFIG, cur);
+  log('live request', rq, on ? 'applied' : 'already on / superseded');
+  return on;
 }
 
 function printOnboarding() {
@@ -1098,6 +1128,9 @@ function printOnboarding() {
   粘贴到 Numable 的「我的 → 凭证」里，就能在手机和桌面组件上看到用量。
 
   · 只上传聚合数字，你的代码与对话永不离开本机
+  · 实时会话已打开：各会话的状态、时长、token 与工具类目
+    （匿名编号，没有项目名、标题、提示词）会同步到手机；
+    不想要就在 /numable-usage 里说「关掉实时会话」（--live off）
 ${line}\n`);
 }
 
@@ -1106,4 +1139,4 @@ if (require.main === module) {
 }
 
 // 供测试用（hook 直接执行本文件，走上面那条）
-module.exports = { deviceId, reviewRow, reviewOfDay, backfillReview, redactTitle, absorb, isHumanPrompt, scan, loadHistory, buildPayload, foldWindows, acquireLock, tryLock, emptyDay, ghostOf, activeMinutes, flushAct, touchSession, countLines };
+module.exports = { applyLiveRequest, deviceId, reviewRow, reviewOfDay, backfillReview, redactTitle, absorb, isHumanPrompt, scan, loadHistory, buildPayload, foldWindows, acquireLock, tryLock, emptyDay, ghostOf, activeMinutes, flushAct, touchSession, countLines };

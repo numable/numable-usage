@@ -583,3 +583,79 @@ test('项目:近 30 天逐日输出、前 30 天合计、按模型', () => {
   assert.deepEqual(p.m, { 'claude-opus-5': 20, 'claude-sonnet-5': 10 });
   assert.equal(p.out, 135);
 });
+
+test('实时会话:新装默认开;老用户不动;手机请求只认一次、晚于本机关闭才生效;加入空间保留开关', async (t) => {
+  const home = tmp();
+  const state = path.join(home, 'state');
+  const proj = path.join(home, '.claude', 'projects', 'p');
+  fs.mkdirSync(proj, { recursive: true });
+  fs.mkdirSync(state);
+  const cfgPath = path.join(state, 'config.json');
+  const cfg = () => JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
+  const f = path.join(proj, 's.jsonl');
+  let liveReq = 0;
+  const server = http.createServer((req, res) => {
+    let b = '';
+    req.on('data', (c) => { b += c; });
+    req.on('end', () => {
+      if (req.url === '/space') return res.end(JSON.stringify({ spaceId: 'sp1', writeToken: 'sp1.w', readToken: 'sp1.r' }));
+      res.end(JSON.stringify(liveReq ? { ok: true, liveReq } : { ok: true }));
+    });
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  t.after(() => { server.closeAllConnections(); server.close(); });
+  const env = { ...process.env, HOME: home, NUMABLE_USAGE_STATE_DIR: state,
+                NUMABLE_USAGE_ENDPOINT: `http://127.0.0.1:${server.address().port}` };
+  let n = 0;
+  const runOnce = () => { fs.appendFileSync(f, jsonl(user('m' + (n++)))); return new Promise((resolve) => spawn(process.execPath, [SCRIPT, '--run'], { env, stdio: 'ignore' }).on('exit', resolve)); };
+  const LIVE = path.join(__dirname, '..', 'plugin', 'scripts', 'live.cjs');
+  const live = (...a) => new Promise((resolve) => spawn(process.execPath, [LIVE, ...a], { env, stdio: 'ignore' }).on('exit', resolve));
+
+  // ① 新装(没有 config):建空间时默认打开实时 + 同步
+  await runOnce();
+  assert.equal(cfg().live, true); assert.equal(cfg().liveSync, true); assert.equal(cfg().liveBy, 'default');
+
+  // ② 老用户(config 早已存在、没有 live 键):升级后照旧不开
+  fs.writeFileSync(cfgPath, JSON.stringify({ spaceId: 'x', writeToken: 'x.w', readToken: 'x.r', device: 'abc123abc123' }));
+  await runOnce();
+  assert.equal(cfg().live, undefined);
+
+  // ③ 手机请求 → 打开(只开 L1,不碰项目名 / 标题)
+  liveReq = Date.now() - 1000;
+  await runOnce();
+  assert.equal(cfg().live, true); assert.equal(cfg().liveSync, true); assert.equal(cfg().liveBy, 'phone');
+  assert.equal(cfg().titles, undefined); assert.equal(cfg().projectNames, undefined);
+
+  // ④ 本机关掉之后,同一个(更早的)请求不再把它打开
+  await live('--live', 'off');
+  assert.ok(cfg().liveOffAt > liveReq);
+  await runOnce();
+  assert.equal(cfg().live, false);
+
+  // ④b 手机上点在前、本机关在后,电脑这才收到那个请求(没见过的请求,但早于关闭)→ 仍不打开
+  const offAt = cfg().liveOffAt;
+  liveReq = offAt - 500;
+  fs.writeFileSync(cfgPath, JSON.stringify({ ...cfg(), liveReqSeen: 0 }));
+  await runOnce();
+  assert.equal(cfg().live, false);
+
+  // ④c 同一个请求只认一次:没有关闭时刻(手改过 config)时,见过的请求也不再打开
+  liveReq = Date.now();
+  await runOnce();
+  assert.equal(cfg().live, true);
+  fs.writeFileSync(cfgPath, JSON.stringify({ ...cfg(), live: false, liveSync: false, liveOffAt: undefined }));
+  await runOnce();
+  assert.equal(cfg().live, false);
+
+  // ⑤ 手机上再点一次(更新的时刻)→ 重新打开
+  liveReq = Date.now() + 5000;
+  await runOnce();
+  assert.equal(cfg().live, true);
+
+  // ⑥ 加入另一个空间:本机开关跟着走
+  liveReq = 0;
+  const code = 'nu1.' + Buffer.from(JSON.stringify({ s: 'sp2abcdef', w: 'sp2abcdef.' + 'w'.repeat(24), r: 'sp2abcdef.' + 'r'.repeat(24), e: env.NUMABLE_USAGE_ENDPOINT })).toString('base64url');
+  await new Promise((resolve) => spawn(process.execPath, [SCRIPT, '--join', code], { env, stdio: 'ignore' }).on('exit', resolve));
+  assert.equal(cfg().spaceId, 'sp2abcdef');
+  assert.equal(cfg().live, true); assert.equal(cfg().liveSync, true);
+});

@@ -475,5 +475,23 @@ console.log('\n── 服务器通知(P3)──');
   } finally { relay.close(); }
 }
 
+console.log('\n── 手机请求打开实时会话(/live/enable)──');
+{
+  const snap = { source: 'claude-code', device: 'aabbcc112233', snapshot: { v: 1, days: [{ date: '2026-08-20', msgs: 1, sessions: 1, out: 1, in: 1, cacheCreate: 0 }] } };
+  const i0 = await post('/ingest', snap, writeToken);
+  ok(i0.s === 200 && i0.j.liveReq === undefined, '没请求过:ingest 回包不带 liveReq');
+  ok((await post('/live/enable', {}, writeToken)).s === 401, '写令牌不能请求(只认手机的读令牌)');
+  ok((await post('/live/enable', {})).s === 401, '无令牌 → 401');
+  const t0 = Date.now();
+  const en = await post('/live/enable', {}, readToken);
+  ok(en.s === 200 && en.j.ok && en.j.at >= t0, `读令牌请求 → 记下时刻(${en.s})`);
+  const i1 = await post('/ingest', snap, writeToken);
+  ok(i1.s === 200 && i1.j.liveReq === en.j.at, `✦ 电脑下一次 ingest 回包带回同一时刻(${i1.j && i1.j.liveReq})`);
+  const g = await J('/live', { headers: { authorization: 'Bearer ' + readToken } });
+  ok(g.s === 200 && g.j.req === en.j.at, `✦ 页面读实时数据能看到「已请求」(${g.j && g.j.req})`);
+  const go = await J('/live', { headers: { authorization: 'Bearer ' + other.j.readToken } });
+  ok(go.s === 200 && !go.j.req, '别的空间看不到这个请求');
+}
+
 console.log(`\n${fail === 0 ? '✅' : '❌'}  pass ${pass} · fail ${fail}\n`);
 process.exit(fail ? 1 : 0);

@@ -217,6 +217,7 @@ export class LiveSpace {
     this.env = env;
     this.rows = null;
     this.subs = null;
+    this.req = undefined;
     this.win = 0; this.n = 0;
   }
 
@@ -300,6 +301,16 @@ export class LiveSpace {
       return Response.json({ ok: true, on: true, opts: subs[id].opts });
     }
 
+    // 手机请求过「在电脑上打开」的时刻(worker /live/enable 已验读令牌、已写 D1)
+    if (req.method === 'POST' && url.pathname === '/req') {
+      let b; try { b = await req.json(); } catch { return Response.json({ error: 'bad_json' }, { status: 400 }); }
+      const at = Number(b && b.at);
+      if (!Number.isFinite(at) || at <= 0) return Response.json({ error: 'bad_at' }, { status: 400 });
+      this.req = at;
+      await this.ctx.storage.put('req', at);
+      return Response.json({ ok: true });
+    }
+
     if (req.method === 'POST') {
       const w = Math.floor(now / 60000);
       if (w !== this.win) { this.win = w; this.n = 0; }
@@ -339,7 +350,8 @@ export class LiveSpace {
         return Response.json({ updatedAt: merged.updatedAt, w: widgetView(merged, { win: n('win'), tzo, rows: n('rows') || 8, lanes: n('lanes') || 10 }) },
           { headers: { 'cache-control': 'no-store' } });
       }
-      return Response.json(merged, { headers: { 'cache-control': 'no-store' } });
+      if (this.req === undefined) this.req = (await this.ctx.storage.get('req')) || 0;
+      return Response.json(this.req ? { ...merged, req: this.req } : merged, { headers: { 'cache-control': 'no-store' } });
     }
     return Response.json({ error: 'not_found' }, { status: 404 });
   }

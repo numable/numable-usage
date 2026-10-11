@@ -684,7 +684,7 @@ function cmdLive(v, w) {
   if (v === 'sync') {
     if (w === 'on' || w === 'off') {
       cur.liveSync = w === 'on';
-      if (cur.liveSync) cur.live = true;
+      if (cur.liveSync) cur.live = true; else cur.liveOffAt = Date.now();   // 手机上更早的请求不再把它打开
       writeJson(CONFIG, cur);
       console.log(w === 'on'
         ? (cur.writeToken
@@ -698,6 +698,7 @@ function cmdLive(v, w) {
   }
   if (v === 'on' || v === 'off') {
     cur.live = v === 'on';
+    if (!cur.live) cur.liveOffAt = Date.now();
     writeJson(CONFIG, cur);
     console.log(v === 'on'
       ? '已打开实时会话:从下一次事件起记录各会话的状态与每一轮的结构(只在本机,不上传)。'
