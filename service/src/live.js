@@ -115,7 +115,7 @@ export function stuckOf(s, now) {
 const stuckWhy = (k) => (k.k === 'fail' ? [`连续 ${k.n} 次工具失败`, `${k.n} tool failures in a row`]
   : k.k === 'wait' ? [`等你授权 ${k.m} 分钟`, `waiting ${k.m} min for approval`]
   : k.k === 'ctx' ? [`这一轮压缩了 ${k.n} 次上下文`, `context compacted ${k.n}× this turn`]
-  : [`这一轮 ${k.m} 分钟、${k.n} 次调用`, `${k.m} min, ${k.n} calls this turn`]);   // 组件一行放得下(原「…次工具调用」在 42 档被截)
+  : [`这一轮 ${k.m} 分钟、${k.n} 次调用`, `${k.m} min · ${k.n} calls`]);   // 组件一行放得下(原「…次工具调用」在 42 档被截)
 
 /** 合并各设备 → GET /live 的返回体。排序不在这里做(三个组件三种排法,由渲染层排)。 */
 export function mergeLive(rows, now) {
