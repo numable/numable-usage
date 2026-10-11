@@ -18,5 +18,12 @@ description: 查看 Numable 用量小组件的接入状态、取出接入所需�
   才运行 `node "${CLAUDE_PLUGIN_ROOT}/scripts/collect.cjs" --forget <标识>`。
   一次只删用户点名的那一个；不要替用户挑，也不要因为输出里建议了就自己去删 —— 删除不可撤销。
 
+- 「实时会话 / 现在在跑什么 / 哪个在等我」→ 运行 `node "${CLAUDE_PLUGIN_ROOT}/scripts/live.cjs" --sessions`
+- 「打开 / 关闭实时会话」→ 运行 `node "${CLAUDE_PLUGIN_ROOT}/scripts/live.cjs" --live on`(或 `off`);不带参数看现状
+  (目前只记在本机、不上传;打开前可以把这一点告诉用户)
+- 「状态栏怎么配」→ 告诉用户在 `~/.claude/settings.json` 加
+  `"statusLine": {"type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/live.cjs\" --statusline"}`,
+  其中 `${CLAUDE_PLUGIN_ROOT}` 换成它的实际值(运行 `echo "${CLAUDE_PLUGIN_ROOT}"` 取);**不要替用户改 settings.json**
+
 把命令输出**原样**展示给用户（令牌和加入串是给人复制的，不要改写、不要截断、不要总结掉）。
 不要解释脚本做了什么，除非用户问。
