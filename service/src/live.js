@@ -160,6 +160,11 @@ export class LiveSpace {
 
     if (req.method === 'GET') {
       const merged = mergeLive(rows, now);
+      if (url.searchParams.get('view') === 'a') {
+        const n = (k) => Number(url.searchParams.get(k));
+        return Response.json({ updatedAt: merged.updatedAt, a: alertView(merged, { perm: url.searchParams.has('perm') ? n('perm') : NaN, long: url.searchParams.has('long') ? n('long') : NaN }) },
+          { headers: { 'cache-control': 'no-store' } });
+      }
       if (url.searchParams.get('view') === 'w') {
         const n = (k) => Number(url.searchParams.get(k));
         // 时区:取数流把「看的人那台设备此刻的时分」(lt=HHmm)与 ms 一起带来,这里反推 UTC 偏移 ——
@@ -352,4 +357,42 @@ export function widgetView(merged, opts = {}) {
     m42: Math.max(0, shown.length - 3) * (shown.length > 4 ? 1 : 0), m44: Math.max(0, shown.length - 7) * (shown.length > 8 ? 1 : 0),
     color: C,
   };
+}
+
+// ─────────────────────────── 提醒视图(?view=a,P2 · 设计 §6.1)───────────────────────────
+// 手机端提醒(.xjob)每轮取这一份,只回答两件事,各带一个「事件键」—— 判定流程只在键变了时响,同一件事不重复:
+//   wait:有会话等你授权 ≥ permMin 分钟(取等得最久的那个);键 = 设备:会话:开始等的时刻
+//   done:有会话「一轮跑了 ≥ longMin 分钟、跑完停下等你」且你还没接着说(状态仍是等你输入);键 = 设备:会话:轮号
+// 不设「刚刚结束」时间窗:手机端检查间隔是 15~30 分钟级,窗口一短就漏;用「仍在等你」判,你一接着说它就自然消失。
+export function alertView(merged, opts = {}) {
+  const now = merged.now;
+  const permMin = Number.isFinite(opts.perm) && opts.perm >= 0 ? Math.min(opts.perm, 240) : 3;
+  const longMin = Number.isFinite(opts.long) && opts.long > 0 ? Math.min(opts.long, 600) : 10;
+  const label = {};
+  let li = 0;
+  for (const s of [...merged.sessions].sort((a, b) => a.startAt - b.startAt)) {
+    const k = s.proj || 'none';
+    if (!label[k]) { const L = LETTERS[li++ % 26]; label[k] = s.pname ? { z: s.pname, e: s.pname } : { z: `项目 ${L}`, e: `Project ${L}` }; }
+  }
+  const out = { wait: 0, waitKey: '', wProjZ: '', wProjE: '', wMins: '', wN: 0, done: 0, doneKey: '', dProjZ: '', dProjE: '', dMins: '' };
+
+  const waiting = merged.sessions
+    .filter((s) => s.state === 'perm' && (s.permSince || s.changedAt) && now - (s.permSince || s.changedAt) >= permMin * 60e3)
+    .sort((a, b) => (a.permSince || a.changedAt) - (b.permSince || b.changedAt));
+  if (waiting.length) {
+    const s = waiting[0], since = s.permSince || s.changedAt;
+    Object.assign(out, { wait: 1, waitKey: `${s.dev}:${s.sid}:${since}`, wProjZ: label[s.proj || 'none'].z, wProjE: label[s.proj || 'none'].e,
+      wMins: String(Math.max(1, Math.round((now - since) / 60e3))), wN: waiting.length });
+  }
+
+  const done = merged.sessions
+    .map((s) => ({ s, t: s.turns[s.turns.length - 1] }))
+    .filter(({ s, t }) => s.state === 'input' && t && t.e && t.end === 'ok' && (t.e - t.s - t.perm) >= longMin * 60e3)
+    .sort((a, b) => b.t.e - a.t.e);
+  if (done.length) {
+    const { s, t } = done[0];
+    Object.assign(out, { done: 1, doneKey: `${s.dev}:${s.sid}:${t.n}`, dProjZ: label[s.proj || 'none'].z, dProjE: label[s.proj || 'none'].e,
+      dMins: String(Math.max(1, Math.round((t.e - t.s - t.perm) / 60e3))) });
+  }
+  return out;
 }

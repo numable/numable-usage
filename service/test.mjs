@@ -326,6 +326,26 @@ console.log('\n── 实时会话 /live ──');
   ok(sk && Math.abs(sk.changedAt - (now - 10e3)) < 3000 && Math.abs(sk.turns[0].s - (now - 30e3)) < 3000 && sk.state === 'running',
     `✦ 慢 2 分钟的设备被校正(changedAt 偏 ${sk && Math.round((sk.changedAt - (now - 10e3)) / 1000)}s);校正前它会被判成断开`);
 
+  // 提醒视图:等授权 ≥ N 分钟(取等得最久的)/ 长任务跑完仍在等你;事件键同一件事不变
+  const M = 60e3;
+  await livePost('aa11', { tier: 2, devNow: now, sessions: [
+    sess({ sid: 'aaaa0001', pname: 'Numable', state: 'perm', permSince: now - 5 * M, changedAt: now - 5 * M }),
+    sess({ sid: 'aaaa0002', state: 'perm', permSince: now - 1 * M, changedAt: now - 1 * M }),
+    sess({ sid: 'aaaa0003', state: 'input', changedAt: now - 2 * M, turns: [turn({ n: 3, s: now - 20 * M, e: now - 2 * M, perm: 60e3, end: 'ok' })] }),
+    sess({ sid: 'aaaa0004', state: 'input', changedAt: now - 2 * M, turns: [turn({ n: 1, s: now - 5 * M, e: now - 2 * M, end: 'ok' })] }),
+    sess({ sid: 'aaaa0005', state: 'running', turns: [turn({ n: 2, s: now - 30 * M, e: now - 15 * M, end: 'ok' }), turn({ n: 3, s: now - 1 * M })] }),
+  ] });
+  const av = async (q) => (await J('/live?view=a' + q, { headers: { authorization: 'Bearer ' + R } })).j.a;
+  let a = await av('');
+  ok(a.wait === 1 && a.waitKey.endsWith(':aaaa0001:' + (now - 5 * M)) && a.wMins === '5' && a.wProjZ === 'Numable' && a.wN === 1,
+    `✦ 等授权:只算 ≥3 分钟的,键 = 设备:会话:开始等的时刻(${a.waitKey} / ${a.wMins} 分)`);
+  ok(a.done === 1 && a.doneKey.endsWith(':aaaa0003:3') && a.dMins === '17',
+    `✦ 跑完等你:实跑 ≥10 分钟(扣掉等授权)、且仍在等你;已经接着跑的不算(${a.doneKey} / ${a.dMins} 分)`);
+  a = await av('&perm=0&long=60');
+  ok(a.wN === 2 && a.done === 0, '阈值参数生效(perm=0 → 两个都算;long=60 → 没有)');
+  a = await (async () => { await livePost('aa11', { tier: 1, devNow: now, sessions: [sess()] }); return av(''); })();
+  ok(a.wait === 0 && a.waitKey === '' && a.done === 0, '没有符合的 → 键为空(判定流程据此不写基准、不响)');
+
   ok((await livePost('aa11', { tier: 1, devNow: now, sessions: [], pad: 'x'.repeat(70000) })).s === 413, '超 64KB → 413');
   let limited = false;
   for (let i = 0; i < 45 && !limited; i++) limited = (await livePost('cc33', { tier: 1, devNow: Date.now(), sessions: [] })).s === 429;
