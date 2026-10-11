@@ -271,6 +271,41 @@ ok((await post('/ingest', big, writeToken)).s === 413, '超 256KB → 413');
 ok((await post('/ingest', { source: 'nope', snapshot: {} }, writeToken)).s === 400, '未知 source → 400');
 
 
+console.log('\n── 每日回顾(0.9.0)──');
+{
+  const today = new Date().toISOString().slice(0, 10);
+  const yday = new Date(Date.now() - 864e5).toISOString().slice(0, 10);
+  const old = new Date(Date.now() - 20 * 864e5).toISOString().slice(0, 10);
+  const day = (date, ps) => ({ date, msgs: 1, sessions: 1, out: 1, in: 0, cacheCreate: 0, ps });
+  const snap = (days) => ({ source: 'claude-code', snapshot: { days, byModel: {}, hours: {}, totals: {} } });
+  // 设备 1:一个有名字的项目 + 一个匿名项目;夹带脏字段
+  await post('/ingest', { ...snap([
+    day(today, [{ p: 'aaaaaaaaaa', nm: 'Numable', n: 3, a: 74, o: 1000, la: 10, lr: 2, ts: ['多泳道组件', 'x'.repeat(200)], cwd: '/Users/secret' },
+                { p: 'bbbbbbbbbb', n: 1, a: 20, o: 50, la: 0, lr: 0 },
+                { p: 'NOT-HEX', n: 9, a: 999 }]),
+    day(yday, [{ p: 'bbbbbbbbbb', n: 2, a: 40, o: 80, la: 1, lr: 1 }]),
+    day(old, [{ p: 'aaaaaaaaaa', nm: 'Numable', n: 1, a: 5, o: 1, la: 0, lr: 0 }]),
+  ]), device: 'aaa111' }, writeToken);
+  // 设备 2:同名项目 Numable(编号不同)→ 合并;另一个匿名项目
+  await post('/ingest', { ...snap([
+    day(today, [{ p: 'cccccccccc', nm: 'Numable', n: 1, a: 10, o: 200, la: 5, lr: 0, ts: ['多泳道组件', '回顾页'] },
+                { p: 'dddddddddd', n: 1, a: 60, o: 10, la: 0, lr: 0 }]),
+  ]), device: 'bbb222' }, writeToken);
+  const rv = (await J('/s?lite=1&today=' + today, { headers: { authorization: 'Bearer ' + readToken } })).j.merged.review;
+  const t = rv.days[today];
+  const blob = JSON.stringify(rv);
+  ok(rv.has === 1 && t && !rv.days[old], `近 14 天才有,20 天前的不出(${Object.keys(rv.days)})`);
+  ok(!/secret|NOT-HEX|999/.test(blob), '✦ 脏字段 / 非法项目号整行丢');
+  const nb = t.rows.find((r) => r.nm === 'Numable');
+  ok(nb && nb.n === 4 && nb.a === 84 && nb.o === 1200 && nb.la === 15, `✦ 两台设备的同名项目合并(${JSON.stringify(nb)})`);
+  ok(nb && nb.ts.length === 3 && nb.ts[1].length === 80 && nb.ts.includes('回顾页'), '标题去重、截 80 字、合并两台的');
+  const anon = t.rows.filter((r) => !r.nm);
+  ok(anon.length === 2 && anon.every((r) => /^[A-Z]$/.test(r.l)), '匿名项目编字母');
+  const b = t.rows.find((r) => !r.nm && r.a === 20), by = rv.days[yday].rows.find((r) => !r.nm);
+  ok(b && by && b.l === by.l, `✦ 同一个匿名项目在不同的天字母不变(${b && b.l} / ${by && by.l})`);
+  ok(t.rows[0].a >= t.rows[1].a && t.n === 6 && t.a === 164, '按活跃时长排序,当天合计');
+}
+
 console.log('\n── 实时会话 /live ──');
 {
   // 复用开头建的空间:/space 每 IP 每分钟限 5 个,前面的用例已经建过几个
@@ -345,6 +380,24 @@ console.log('\n── 实时会话 /live ──');
   ok(a.wN === 2 && a.done === 0, '阈值参数生效(perm=0 → 两个都算;long=60 → 没有)');
   a = await (async () => { await livePost('aa11', { tier: 1, devNow: now, sessions: [sess()] }); return av(''); })();
   ok(a.wait === 0 && a.waitKey === '' && a.done === 0, '没有符合的 → 键为空(判定流程据此不写基准、不响)');
+
+  // 卡住检测:连续失败 / 转圈 / 反复压缩 / 久等授权;不在跑的不判
+  await livePost('aa11', { tier: 1, devNow: now, sessions: [
+    sess({ sid: 'bbbb0001', fs: 6 }),
+    sess({ sid: 'bbbb0002', turns: [turn({ s: now - 50 * M, tools: 120 })] }),
+    sess({ sid: 'bbbb0003', turns: [turn({ cmp: 3 })] }),
+    sess({ sid: 'bbbb0004', state: 'perm', permSince: now - 20 * M }),
+    sess({ sid: 'bbbb0005', fs: 2, turns: [turn({ cmp: 1 })] }),
+    sess({ sid: 'bbbb0006', state: 'input', fs: 9 }),
+  ] });
+  const gs = (await liveGet()).j;
+  const k = Object.fromEntries(gs.sessions.map((x) => [x.sid, x.stuck && x.stuck.k]));
+  ok(k.bbbb0001 === 'fail' && k.bbbb0002 === 'spin' && k.bbbb0003 === 'ctx' && k.bbbb0004 === 'wait' && !k.bbbb0005 && !k.bbbb0006 && gs.count.stuck === 4,
+    `✦ 卡住四种原因;轻微的、不在跑的不算(${JSON.stringify(k)})`);
+  const sa = await av('');
+  ok(sa.stuck === 1 && /:fail:1$/.test(sa.stuckKey) && sa.sWhyZ === '连续 6 次工具失败', `提醒视图给卡住的键与原因(${sa.stuckKey})`);
+  const wv = (await J('/live?view=w', { headers: { authorization: 'Bearer ' + R } })).j.w;
+  ok(wv.board[0].warn === 1 && /^可能卡住/.test(wv.board[0].tz) && wv.n.stuck === 4, '组件视图:卡住的排前、变黄、写原因');
 
   ok((await livePost('aa11', { tier: 1, devNow: now, sessions: [], pad: 'x'.repeat(70000) })).s === 413, '超 64KB → 413');
   let limited = false;

@@ -314,3 +314,19 @@ test('守护进程:打开同步后状态一变就推,推的体里没有提示词
   assert.equal(states[states.length - 1], 'input');
   assert.doesNotMatch(got.map((g) => g.body).join(''), /SECRET/);
 });
+
+test('卡住检测的原料:连续失败(成功清零、你说新的一句清零)、每轮失败数与压缩数', () => {
+  const live = L.emptyLive();
+  feed(live, ev('UserPromptSubmit'));
+  for (let i = 0; i < 6; i++) feed(live, ev('PreToolUse', { tool_name: 'Bash', tool_use_id: 'f' + i }), ev('PostToolUseFailure', { tool_name: 'Bash', tool_use_id: 'f' + i }));
+  let s = live.sessions.s1;
+  assert.equal(s.fs, 6); assert.equal(s.turns[0].err, 6);
+  feed(live, ev('PreToolUse', { tool_name: 'Bash', tool_use_id: 'ok' }), ev('PostToolUse', { tool_name: 'Bash', tool_use_id: 'ok' }));
+  assert.equal(s.fs, 0);
+  feed(live, ev('PreToolUse', { tool_name: 'Bash', tool_use_id: 'f9' }), ev('PostToolUseFailure', { tool_name: 'Bash', tool_use_id: 'f9' }), ev('UserPromptSubmit'));
+  assert.equal(s.fs, 0);
+  feed(live, ev('PreCompact'), ev('PreCompact'));
+  assert.equal(s.turns[1].cmp, 2);
+  const x = L.buildLivePayload(live, { salt: 'S', now: clock, alive: ALIVE }).sessions[0];
+  assert.equal(x.fs, 0); assert.equal(x.turns[0].err, 7); assert.equal(x.turns[1].cmp, 2);
+});

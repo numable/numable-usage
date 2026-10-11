@@ -43,7 +43,7 @@ function sanitizeTurn(t) {
     seq: typeof t.seq === 'string' && SEQ_RE.test(t.seq) ? t.seq : '',
     cells: typeof t.cells === 'string' && CELLS_RE.test(t.cells) ? t.cells : '',
     long, out: int(t.out), in: int(t.in), cw: int(t.cw),
-    end: oneOf(t.end, ENDS, null),
+    end: oneOf(t.end, ENDS, null), err: int(t.err, 1e5), cmp: int(t.cmp, 1e4),
   };
 }
 
@@ -57,7 +57,7 @@ function sanitizeSession(x, tier) {
     startAt: int(x.startAt), lastAt: int(x.lastAt), beatAt: int(x.beatAt), endAt: intOrNull(x.endAt),
     permSince: intOrNull(x.permSince),
     model: typeof x.model === 'string' && MODEL_RE.test(x.model) ? x.model : null,
-    tools: int(x.tools, 1e7), errors: int(x.errors, 1e7), compactions: int(x.compactions, 1e4),
+    tools: int(x.tools, 1e7), errors: int(x.errors, 1e7), compactions: int(x.compactions, 1e4), fs: int(x.fs, 1e5),
     turns: (Array.isArray(x.turns) ? x.turns.slice(-MAX_TURNS) : []).map(sanitizeTurn).filter(Boolean),
     subs: (Array.isArray(x.subs) ? x.subs.slice(-30) : [])
       .filter((s) => Array.isArray(s)).map((s) => [int(s[0]), int(s[1]), int(s[2], 1e6)]).filter((s) => s[0] > 0),
@@ -95,6 +95,28 @@ export function deriveState(s, now) {
   return s.state;
 }
 
+/**
+ * 卡住检测(§6.2):只对还在跑 / 等授权的会话判;断开另有状态。返回 null 或 { k, … }:
+ *   fail = 连续 ≥5 次工具调用失败 · spin = 这一轮跑了 >40 分钟且调了 >80 次工具 ·
+ *   ctx  = 这一轮里上下文压缩了 ≥2 次 · wait = 等你授权 >15 分钟
+ * 只给信号,不下结论 —— 文案写「可能卡住」。
+ */
+export const STUCK = { fail: 5, spinMin: 40, spinTools: 80, ctx: 2, waitMin: 15 };
+export function stuckOf(s, now) {
+  if (s.state !== 'running' && s.state !== 'perm') return null;
+  const t = s.turns[s.turns.length - 1];
+  const open = t && !t.e ? t : null;
+  if ((s.fs || 0) >= STUCK.fail) return { k: 'fail', n: s.fs };
+  if (s.state === 'perm' && now - (s.permSince || s.changedAt) > STUCK.waitMin * 60e3) return { k: 'wait', m: Math.round((now - (s.permSince || s.changedAt)) / 60e3) };
+  if (open && (open.cmp || 0) >= STUCK.ctx) return { k: 'ctx', n: open.cmp };
+  if (open && now - open.s > STUCK.spinMin * 60e3 && open.tools > STUCK.spinTools) return { k: 'spin', m: Math.round((now - open.s) / 60e3), n: open.tools };
+  return null;
+}
+const stuckWhy = (k) => (k.k === 'fail' ? [`连续 ${k.n} 次工具失败`, `${k.n} tool failures in a row`]
+  : k.k === 'wait' ? [`等你授权 ${k.m} 分钟`, `waiting ${k.m} min for approval`]
+  : k.k === 'ctx' ? [`这一轮上下文压缩了 ${k.n} 次`, `context compacted ${k.n} times this turn`]
+  : [`这一轮 ${k.m} 分钟、${k.n} 次工具调用`, `${k.m} min and ${k.n} tool calls this turn`]);
+
 /** 合并各设备 → GET /live 的返回体。排序不在这里做(三个组件三种排法,由渲染层排)。 */
 export function mergeLive(rows, now) {
   const sessions = [];
@@ -108,12 +130,15 @@ export function mergeLive(rows, now) {
       const shown = deriveState(s, now);
       // 推导出「断开」时,changedAt 用最后一次听到它的时刻 —— 会话栈按变化排序要靠它
       const changedAt = shown === 'lost' && s.state !== 'lost' ? Math.max(s.beatAt || 0, s.lastAt || 0) : s.changedAt;
-      sessions.push({ ...s, dev, state: shown, changedAt, changeKind: shown === 'lost' && s.state !== 'lost' ? 'lost' : s.changeKind });
+      const x = { ...s, dev, state: shown, changedAt, changeKind: shown === 'lost' && s.state !== 'lost' ? 'lost' : s.changeKind };
+      x.stuck = stuckOf(x, now);
+      sessions.push(x);
     }
   }
   const count = { running: 0, perm: 0, input: 0, parked: 0, lost: 0, ended: 0 };
   for (const s of sessions) count[s.state]++;
   count.parallel = count.running + count.perm + count.input;
+  count.stuck = sessions.filter((s) => s.stuck).length;
   const updatedAt = devices.reduce((a, d) => Math.max(a, d.at), 0);
   return { now, updatedAt, count, devices, sessions };
 }
@@ -274,11 +299,12 @@ export function widgetView(merged, opts = {}) {
     const p = projLabel[s.proj || 'none'];
     const dz = DOING[lastCat(s)] || DOING.o;
     let tz, te;
-    if (s.state === 'running') { tz = s.title || `正在${dz[0]}`; te = s.title || dz[1]; }
+    if (s.stuck) { const w = stuckWhy(s.stuck); tz = `可能卡住 · ${w[0]}`; te = `May be stuck · ${w[1]}`; }
+    else if (s.state === 'running') { tz = s.title || `正在${dz[0]}`; te = s.title || dz[1]; }
     else if (s.state === 'perm' || s.state === 'input') { tz = `${st.z} · ${hhmm(since, tzo)} 起`; te = `${st.e} · since ${hhmm(since, tzo)}`; }
     else { tz = s.title ? `${st.z} · ${s.title}` : st.z; te = s.title ? `${st.e} · ${s.title}` : st.e; }
     return {
-      st: s.state, ic: st.ic, c: st.c, warn: s.state === 'perm' || s.state === 'input' ? 1 : 0,
+      st: s.state, ic: st.ic, c: st.c, warn: s.state === 'perm' || s.state === 'input' || s.stuck ? 1 : 0,
       pz: p.z, pe: p.e, lab: label[s.dev + s.sid], tz, te,
       at: hhmm(since, tzo), turns: s.turns.length ? s.turns[s.turns.length - 1].n : 0,
       run: dfmt(runMs(s, now)), tok: kfmt(totTok(s)), dim: s.state === 'ended' || s.state === 'parked' || s.state === 'lost' ? 1 : 0,
@@ -287,7 +313,7 @@ export function widgetView(merged, opts = {}) {
 
   // ── 概况行:等你授权 > 等你输入 > 运行中 > 其余;已结束只留 30 分钟内的 ──
   const shown = merged.sessions.filter((s) => s.state !== 'ended' || now - s.changedAt < 30 * 60e3);
-  const board = [...shown].sort((a, b) => ORDER[a.state] - ORDER[b.state] || b.changedAt - a.changedAt)
+  const board = [...shown].sort((a, b) => (b.stuck ? 1 : 0) - (a.stuck ? 1 : 0) || ORDER[a.state] - ORDER[b.state] || b.changedAt - a.changedAt)
     .slice(0, opts.rows || 8).map((s, i) => ({ i, ...row(s) }));
 
   // ── 多泳道:工程为池(按池内最新变化排)、会话为道(池内按开始时刻,位置不随状态变)──
@@ -349,7 +375,7 @@ export function widgetView(merged, opts = {}) {
   const c = merged.count;
   return {
     has: merged.sessions.length ? 1 : 0, upd: merged.updatedAt ? hhmm(merged.updatedAt, tzo) : '',
-    n: { par: c.parallel, run: c.running, perm: c.perm, input: c.input, wait: c.perm + c.input,
+    n: { par: c.parallel, run: c.running, perm: c.perm, input: c.input, wait: c.perm + c.input, stuck: c.stuck,
       proj: new Set(merged.sessions.filter((s) => ['running', 'perm', 'input'].includes(s.state)).map((s) => s.proj || 'none')).size },
     board, more: Math.max(0, shown.length - board.length), nb: shown.length, devs: merged.devices.length,
     lanes, hiddenPools: hidden, winH, flat, nl: lanes.length, n4: Math.min(lanes.length, 4), n10: Math.min(lanes.length, 10),   // 实际画几道:RCN 尺寸字段里不能写方法
@@ -374,7 +400,8 @@ export function alertView(merged, opts = {}) {
     const k = s.proj || 'none';
     if (!label[k]) { const L = LETTERS[li++ % 26]; label[k] = s.pname ? { z: s.pname, e: s.pname } : { z: `项目 ${L}`, e: `Project ${L}` }; }
   }
-  const out = { wait: 0, waitKey: '', wProjZ: '', wProjE: '', wMins: '', wN: 0, done: 0, doneKey: '', dProjZ: '', dProjE: '', dMins: '' };
+  const out = { wait: 0, waitKey: '', wProjZ: '', wProjE: '', wMins: '', wN: 0, done: 0, doneKey: '', dProjZ: '', dProjE: '', dMins: '',
+    stuck: 0, stuckKey: '', sProjZ: '', sProjE: '', sWhyZ: '', sWhyE: '' };
 
   const waiting = merged.sessions
     .filter((s) => s.state === 'perm' && (s.permSince || s.changedAt) && now - (s.permSince || s.changedAt) >= permMin * 60e3)
@@ -393,6 +420,12 @@ export function alertView(merged, opts = {}) {
     const { s, t } = done[0];
     Object.assign(out, { done: 1, doneKey: `${s.dev}:${s.sid}:${t.n}`, dProjZ: label[s.proj || 'none'].z, dProjE: label[s.proj || 'none'].e,
       dMins: String(Math.max(1, Math.round((t.e - t.s - t.perm) / 60e3))) });
+  }
+  // 可能卡住:取最早开始的那一路;键 = 设备:会话:原因:轮号 —— 同一轮同一种原因只响一次,换了原因(比如先失败后转圈)会再响
+  const stuck = merged.sessions.filter((s) => s.stuck).sort((a, b) => a.startAt - b.startAt);
+  if (stuck.length) {
+    const s = stuck[0], t = s.turns[s.turns.length - 1], w = stuckWhy(s.stuck);
+    Object.assign(out, { stuck: 1, stuckKey: `${s.dev}:${s.sid}:${s.stuck.k}:${t ? t.n : 0}`, sProjZ: label[s.proj || 'none'].z, sProjE: label[s.proj || 'none'].e, sWhyZ: w[0], sWhyE: w[1] });
   }
   return out;
 }

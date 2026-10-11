@@ -134,7 +134,7 @@ function setState(s, state, kind, now) {
 
 function openTurn(s, now) {
   const t = { n: (s.turns.length ? s.turns[s.turns.length - 1].n : 0) + 1, s: now, e: null,
-    permMs: 0, tools: 0, seq: [], longest: null, tok: { out: 0, in: 0, cw: 0 }, end: null };
+    permMs: 0, tools: 0, seq: [], longest: null, tok: { out: 0, in: 0, cw: 0 }, end: null, err: 0, cmp: 0 };
   s.turns.push(t);
   if (s.turns.length > MAX_TURNS) s.turns.splice(0, s.turns.length - MAX_TURNS);
   return t;
@@ -191,6 +191,7 @@ function reduce(live, ev, opts = {}) {
       // 上一轮没收尾就来了新的一句 = 上一轮被你打断了(Esc 不一定触发 Stop)
       if (curTurn(s)) closeTurn(s, 'interrupt', now);
       openTurn(s, now);
+      s.fs = 0;                                   // 你说了新的一句 = 人已经介入,连续失败从头算
       setState(s, 'running', 'turn', now);
       break;
     }
@@ -232,6 +233,9 @@ function reduce(live, ev, opts = {}) {
         const ms = Number.isFinite(ev.duration_ms) ? ev.duration_ms : (o ? now - o.at : 0);
         if (!t.longest || ms > t.longest[1]) t.longest = [cat, Math.round(ms)];
       }
+      // 卡住检测(§6.2):连续失败计数,成功一次清零;每轮的失败数
+      if (name === 'PostToolUse') s.fs = 0;
+      if (name === 'PostToolUseFailure') { s.fs = (s.fs || 0) + 1; if (t) t.err = (t.err || 0) + 1; }
       if (name === 'PostToolUseFailure') { s.errors++; if (ev.is_interrupt && !inSub) { closeTurn(s, 'interrupt', now); setState(s, 'input', 'interrupt', now); break; } }
       if (s.state === 'perm') { leavePerm(s, now); setState(s, restState(s), 'resume', now); }
       break;
@@ -253,7 +257,7 @@ function reduce(live, ev, opts = {}) {
       if (s.state === 'running' && !curTurn(s) && restState(s) === 'input') setState(s, 'input', 'done', now);
       break;
     }
-    case 'PreCompact': s.compactions++; break;
+    case 'PreCompact': { s.compactions++; const t = curTurn(s); if (t) t.cmp = (t.cmp || 0) + 1; break; }
     case 'SessionEnd': {
       closeTurn(s, 'ended', now);
       s.endAt = now;
@@ -560,7 +564,7 @@ function encodeTurn(t) {
   return {
     n: t.n, s: t.s, e: t.e, perm: t.permMs, tools: t.tools, seq, cells,
     long: t.longest ? [CAT_CODE[t.longest[0]] || 'o', t.longest[1]] : null,
-    out: t.tok.out, in: t.tok.in, cw: t.tok.cw, end: t.end,
+    out: t.tok.out, in: t.tok.in, cw: t.tok.cw, end: t.end, err: t.err || 0, cmp: t.cmp || 0,
   };
 }
 
@@ -583,7 +587,7 @@ function buildLivePayload(live, opts) {
       changedAt: s.changedAt, changeKind: st === 'lost' && s.state !== 'lost' ? 'lost' : s.changeKind,
       startAt: s.startAt, lastAt: s.lastEventAt, beatAt: s.beatAt || s.lastEventAt, endAt: s.endAt || null,
       permSince: s.perm ? s.perm.since : null,
-      model: s.model, tools: s.tools, errors: s.errors, compactions: s.compactions,
+      model: s.model, tools: s.tools, errors: s.errors, compactions: s.compactions, fs: s.fs || 0,
       turns: turns.map(encodeTurn),
       subs: s.subs.slice(-30).map((x) => [x.s, x.e || 0, x.tools || 0]),
     };

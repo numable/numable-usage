@@ -15,6 +15,8 @@
  *   都是判断完 / 数完即丢，正文不落盘、不上报。
  *   cwd 只在本机用来区分项目：上报的是「本机随机盐 + 项目根目录」的哈希，服务端反推不出路径；
  *   用户显式 --projects on 后才附上项目文件夹名（只取最后一段）。gitBranch 不读。
+ *   每日回顾（0.9.0）：按「天 × 项目 × 会话」记首末时刻、活跃时长、增删行数（都是数字）；
+ *   用户显式 --titles on 后才读 type=custom-title 行的 customTitle（会话标题），上报时每个项目每天最多 8 条、本机先脱敏。
  *   上报体里的字符串只有：模型名、日期、固定词表里的工具名、（打开开关时的）项目文件夹名。主机名只以 hash 形式出现。
  *
  * 计数口径（2026-09-24 修正，history v2）：
@@ -271,20 +273,125 @@ const normTool = (n) => {
 };
 
 /** 代码改动行数：编辑结果的补丁只数行首 + / -，新建文件数内容行数。正文本身不留、不传。 */
-function countLines(day, r) {
-  if (!r || typeof r !== 'object') return;
+/** 工具结果里的增 / 删行数(只数补丁行首 + / -,新建文件数行数;正文不留)。 */
+function linesOf(r) {
+  let a = 0, d = 0;
+  if (!r || typeof r !== 'object') return [0, 0];
   if (Array.isArray(r.structuredPatch) && r.structuredPatch.length) {
     for (const h of r.structuredPatch) {
       for (const l of (h && Array.isArray(h.lines) ? h.lines : [])) {
         if (typeof l !== 'string') continue;
-        if (l[0] === '+') day.la++;
-        else if (l[0] === '-') day.lr++;
+        if (l[0] === '+') a++;
+        else if (l[0] === '-') d++;
       }
     }
   } else if (r.type === 'create' && typeof r.content === 'string' && r.content) {
-    day.la += r.content.split('\n').length - (r.content.endsWith('\n') ? 1 : 0);
+    a += r.content.split('\n').length - (r.content.endsWith('\n') ? 1 : 0);
   }
+  return [a, d];
 }
+function countLines(day, r) {
+  const [a, d] = linesOf(r);
+  day.la += a; day.lr += d;
+}
+
+// ---------- 每日回顾(§6.3,0.9.0)----------
+// day.rv["<项目键>|<会话 id>"] = [首, 末, 活跃 ms, 增行, 删行] —— 只在本机;上报时按项目聚合,不带会话 id
+let REVIEW_TITLES = false;            // 由 collectAndPush 按 cfg.titles 设;关着时连 custom-title 行都不读
+const REVIEW_DAYS = 14;
+function touchReview(e, ts) {
+  if (!e[0]) { e[0] = ts; e[1] = ts; e[2] = 60000; return; }
+  if (ts > e[1]) { const g = ts - e[1]; e[2] += g <= GAP_MS ? g : 60000; e[1] = ts; }
+  if (ts < e[0]) e[0] = ts;
+}
+/** 一行会话记录并进回顾。minDay:只收这天及以后(回补时用)。 */
+function reviewRow(days, o, ext, minDay) {
+  if (!ext || !o || typeof o.sessionId !== 'string') return;
+  if (o.type === 'custom-title') {
+    if (REVIEW_TITLES && typeof o.customTitle === 'string' && o.customTitle.trim()) {
+      (ext.titles || (ext.titles = {}))[o.sessionId] = o.customTitle.trim().slice(0, 120);
+    }
+    return;
+  }
+  if (o.type !== 'user' && o.type !== 'assistant') return;
+  const ts = o.timestamp ? Date.parse(o.timestamp) : NaN;
+  if (!Number.isFinite(ts)) return;
+  const date = localDay(new Date(ts));
+  if (minDay && date < minDay) return;
+  const pid = projectOf(ext, o.cwd);
+  if (!pid) return;
+  const day = days[date] || (days[date] = emptyDay());
+  const rv = day.rv || (day.rv = {});
+  const k = pid + '|' + o.sessionId;
+  const e = rv[k] || (rv[k] = [0, 0, 0, 0, 0]);
+  if (!o.isSidechain) touchReview(e, ts);
+  if (o.type === 'user') { const [a, d] = linesOf(o.toolUseResult); e[3] += a; e[4] += d; }
+}
+
+/**
+ * 回补近 14 天的回顾:增量扫描只会处理新追加的行,升级前已扫过的那些天没有 rv。
+ * 只重算 rv / titles,别的聚合一概不碰;每个文件只读到增量扫描已记下的位置 —— 之后的行由增量扫描负责,不会重复计。
+ */
+async function backfillReview(history, root = PROJECTS) {
+  const minDay = localDay(new Date(Date.now() - REVIEW_DAYS * 864e5));
+  for (const [d, day] of Object.entries(history.days)) if (d >= minDay) delete day.rv;
+  history.titles = {};
+  const since = Date.now() - (REVIEW_DAYS + 1) * 864e5;
+  for (const f of listJsonl(root)) {
+    const prev = history.files[f];
+    if (!prev || !(prev.off > 0)) continue;
+    let mt = 0; try { mt = fs.statSync(f).mtimeMs; } catch { continue; }
+    if (mt < since) continue;
+    await new Promise((resolve) => {
+      const rs = fs.createReadStream(f, { start: 0, end: prev.off - 1, encoding: 'utf8' });
+      const rl = readline.createInterface({ input: rs, crlfDelay: Infinity });
+      rl.on('line', (line) => {
+        if (!line) return;
+        try { reviewRow(history.days, JSON.parse(line), history, minDay); } catch { /* 坏行 */ }
+      });
+      rl.on('close', resolve);
+      rs.on('error', () => resolve());
+    });
+  }
+  history.reviewV = 1;
+  history.reviewT = REVIEW_TITLES;
+}
+
+/** 本机标题脱敏(同 live.cjs redactTitle):网址 / 邮箱 / 路径 / 密钥样的长串换成 … */
+function redactTitle(t) {
+  return String(t)
+    .replace(/https?:\/\/\S+/gi, '…')
+    .replace(/[\w.+-]+@[\w-]+\.[\w.-]+/g, '…')
+    .replace(/(?:^|\s)(?:~|\/)[\w.~-]*(?:\/[\w.-]+)+/g, ' …')
+    .replace(/\b(?:sk|pk|rk|ghp|gho|xox[bap]|eyJ)[\w-]{8,}\b/g, '…')
+    .replace(/\b[a-f0-9]{24,}\b/gi, '…')
+    .replace(/\s+/g, ' ').trim().slice(0, 80);
+}
+
+/** 某天的回顾:按项目聚合 → [{p, n, a(分钟), o, la, lr, ts?}],按活跃时长降序,最多 12 个项目。 */
+function reviewOfDay(d, history, withTitles, withNames) {
+  if (!d.rv) return null;
+  const by = {};
+  for (const [k, e] of Object.entries(d.rv)) {
+    const i = k.indexOf('|'), pid = k.slice(0, i), sid = k.slice(i + 1);
+    const g = by[pid] || (by[pid] = { p: pid, n: 0, a: 0, la: 0, lr: 0, t: [] });
+    if (e[2] > 0) g.n++;
+    g.a += e[2]; g.la += e[3]; g.lr += e[4];
+    if (withTitles && history.titles && history.titles[sid]) g.t.push([e[2], history.titles[sid]]);
+  }
+  return Object.values(by).filter((g) => g.n > 0 || g.la || g.lr)
+    .map((g) => {
+      const r = { p: g.p, n: g.n, a: Math.round(g.a / 60000), o: (d.proj && d.proj[g.p] && d.proj[g.p].out) | 0, la: g.la, lr: g.lr };
+      if (withNames && history.projNames && history.projNames[g.p]) r.nm = String(history.projNames[g.p]).slice(0, 40);   // --projects on 才带
+      if (withTitles && g.t.length) {
+        const seen = new Set();
+        r.ts = g.t.sort((x, y) => y[0] - x[0]).map((x) => redactTitle(x[1])).filter((x) => x && !seen.has(x) && seen.add(x)).slice(0, 8);
+      }
+      return r;
+    })
+    .sort((x, y) => y.a - x.a).slice(0, 12);
+}
+
 
 /**
  * 项目键 = 本机随机盐 + 项目根目录的哈希。项目根 = 往上找到的第一个 git 仓库
@@ -317,6 +424,7 @@ const EVENT_KEEP_MS = 12 * 3600e3;                   // 5 小时窗口只看近 
  * ext = history 本身（会话表 / 窗口事件 / 项目盐）；测试里可以不给
  */
 function absorb(days, o, st, ext) {
+  reviewRow(days, o, ext);
   const t = o.type;
   if (t !== 'user' && t !== 'assistant') return false;
   const ts = o.timestamp ? Date.parse(o.timestamp) : NaN;
@@ -520,6 +628,15 @@ function prune(history) {
   for (const [sid, v] of Object.entries(history.sessions || {})) if (!Array.isArray(v) || v[1] < old) delete history.sessions[sid];
   const recentCut = Date.now() - EVENT_KEEP_MS;
   history.events = (history.events || []).filter((e) => Array.isArray(e) && e[0] >= recentCut);
+  // 每日回顾:只留近 20 天的 rv;标题只留还被某天 rv 引用的会话
+  const rvCut = localDay(new Date(Date.now() - (REVIEW_DAYS + 6) * 864e5));
+  const keepSid = new Set();
+  for (const [d, day] of Object.entries(history.days)) {
+    if (!day.rv) continue;
+    if (d < rvCut) { delete day.rv; continue; }
+    for (const k of Object.keys(day.rv)) keepSid.add(k.slice(k.indexOf('|') + 1));
+  }
+  for (const sid of Object.keys(history.titles || {})) if (!keepSid.has(sid)) delete history.titles[sid];
   // 文件表：projects 里已消失的文件清掉，防无限增长
   for (const f of Object.keys(history.files)) if (!fs.existsSync(f)) delete history.files[f];
 }
@@ -558,9 +675,11 @@ function buildPayload(history, device, opts = {}) {
   let tMsgs = 0, tOut = 0, tIn = 0, tCr = 0;
   const allSess = new Set();          // 跨午夜的会话在两天里各出现一次，总数按 id 去重
 
+  const reviewFrom = localDay(new Date(Date.now() - REVIEW_DAYS * 864e5));
   for (const date of Object.keys(history.days).sort()) {
     const d = history.days[date];
     const sessions = Array.isArray(d.sess) ? d.sess.length : 0;
+    const ps = date >= reviewFrom ? reviewOfDay(d, history, opts.titles === true, opts.projectNames === true) : null;
     const m = {};
     for (const [name, v] of Object.entries(d.byModel || {})) {
       m[name] = { in: v.in | 0, out: v.out | 0, c5: v.c5 | 0, c1: v.c1 | 0, rd: v.rd | 0, n: v.msgs | 0 };
@@ -583,6 +702,7 @@ function buildPayload(history, device, opts = {}) {
       h: d.hours || {},                       // 真人发言的小时分布（按天给，服务端据此出星期 × 小时）
       m,                                      // 按模型的 token 明细（服务端据此按价目折算费用）
       t: d.tools || {},                       // 工具调用次数
+      ...(ps && ps.length ? { ps } : {}),     // 0.9.0 起:每日回顾(近 14 天,按项目;标题仅在 --titles on 时有)
     });
     if (Array.isArray(d.sess)) for (const id of d.sess) allSess.add(id);
     tMsgs += d.msgs | 0; tOut += d.out | 0; tIn += d.in | 0; tCr += d.cr | 0;
@@ -939,7 +1059,14 @@ async function collectAndPush({ force = false } = {}) {
   }
 
   const history = loadHistory();
-  const touched = await scan(history);
+  REVIEW_TITLES = cfg.titles === true;
+  let touched = await scan(history);
+  // 每日回顾:第一次升级到 0.9.0、或标题开关变了 → 回补近 14 天(只重算回顾,别的不动)
+  if (history.reviewV !== 1 || history.reviewT !== REVIEW_TITLES) {
+    await backfillReview(history);
+    touched++;
+    log('review backfilled');
+  }
   foldWindows(history);                              // 必须在 prune 之前:prune 会裁掉 12 小时前的事件
   prune(history);
   writeJson(HISTORY, history);
@@ -956,7 +1083,7 @@ async function collectAndPush({ force = false } = {}) {
   }
   const device = cfg.device;
 
-  const payload = buildPayload(history, device, { projectNames: cfg.projectNames === true });
+  const payload = buildPayload(history, device, { projectNames: cfg.projectNames === true, titles: cfg.titles === true });
   const r = await post('/ingest', payload, cfg.writeToken);
   if (!r.ok) { log('ingest failed', r.status, r.text); return; }
   log('pushed', payload.snapshot.days.length, 'days');
@@ -979,4 +1106,4 @@ if (require.main === module) {
 }
 
 // 供测试用（hook 直接执行本文件，走上面那条）
-module.exports = { deviceId, absorb, isHumanPrompt, scan, loadHistory, buildPayload, foldWindows, acquireLock, tryLock, emptyDay, ghostOf, activeMinutes, flushAct, touchSession, countLines };
+module.exports = { deviceId, reviewRow, reviewOfDay, backfillReview, redactTitle, absorb, isHumanPrompt, scan, loadHistory, buildPayload, foldWindows, acquireLock, tryLock, emptyDay, ghostOf, activeMinutes, flushAct, touchSession, countLines };

@@ -122,6 +122,8 @@ const modelMap = (o, max = 16) => {
   return r;
 };
 /** 用户打开开关才会有的项目文件夹名：去控制字符、截 40 字 */
+/** 会话标题(用户打开 --titles 才有):去控制字符、截 80 字 */
+const cleanTitle = (v) => (typeof v === 'string' ? v.replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 80) : '');
 const cleanName = (v) => (typeof v === 'string' ? v.replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 40) : '');
 
 /**
@@ -148,6 +150,13 @@ function sanitizeClaudeCode(s) {
         h: intMap(d.h, hourKey, 24),
         m: modelMap(d.m),
         t: intMap(d.t, (k) => TOOL_RE.test(k), 32),
+        // 0.9.0 起:每日回顾(近 14 天,按项目)。nm / ts 是仅有的两种文本,插件只在用户打开对应开关时才发
+        ...(Array.isArray(d.ps) ? { ps: d.ps.slice(0, 12).filter((r) => r && typeof r.p === 'string' && PROJ_RE.test(r.p)).map((r) => {
+          const row = { p: r.p, n: int(r.n, 1000), a: int(r.a, 1440), o: int(r.o), la: int(r.la), lr: int(r.lr) };
+          const nm = cleanName(r.nm); if (nm) row.nm = nm;
+          if (Array.isArray(r.ts)) { const ts = r.ts.slice(0, 8).map((x) => cleanTitle(x)).filter(Boolean); if (ts.length) row.ts = ts; }
+          return row;
+        }) } : {}),
       });
     }
   }
@@ -431,6 +440,7 @@ function mergeClaudeCode(list, anchor) {
   }
 
   const { colorOf, ...ins } = insights(full, list, anchorDate, tot, models.map((x) => x.name));
+  const review = reviewView(list, anchorDate);
   // 模型分布每行带自己的颜色(「浅|深」串,组件直接用):颜色跟模型走,与页面、每日费用同一套钉槽 —— 不随排名变
   for (const x of models) x.c = colorOf(x.name);
   return {
@@ -441,8 +451,44 @@ function mergeClaudeCode(list, anchor) {
     peakHour: peak ? Number(peak[0]) : -1,
     modelTop: models.length ? models[0].name : '',
     outMax: days.reduce((m, d) => Math.max(m, d.out), 0),
+    review,
     ...ins,
   };
+}
+
+/**
+ * 每日回顾(0.9.0,§6.3):近 14 天每天按项目 —— 会话数、活跃分钟、输出、增删行、(打开标题开关的)会话标题。
+ * 各设备的项目编号互不相通(盐按设备),所以按「设备 + 编号」分行,同名项目合并成一行。
+ * 没上传名字的项目按 14 天总活跃时长排序编「项目 A / B」,同一个项目在不同的天字母不变。
+ */
+function reviewView(list, anchorDate) {
+  if (!anchorDate) return { days: {}, has: 0 };
+  const from = new Date(Date.parse(anchorDate + 'T00:00:00Z') - 13 * 864e5).toISOString().slice(0, 10);
+  const byDay = {};
+  const tot = {};
+  for (const s of list) {
+    for (const d of s.days || []) {
+      if (!d.ps || d.date < from || d.date > anchorDate) continue;
+      for (const r of d.ps) {
+        const key = r.nm ? 'n:' + r.nm : 'p:' + s.device + ':' + r.p;
+        const day = byDay[d.date] || (byDay[d.date] = {});
+        const g = day[key] || (day[key] = { key, nm: r.nm || '', n: 0, a: 0, o: 0, la: 0, lr: 0, ts: [] });
+        g.n += r.n; g.a += r.a; g.o += r.o; g.la += r.la; g.lr += r.lr;
+        for (const t of r.ts || []) if (!g.ts.includes(t) && g.ts.length < 8) g.ts.push(t);
+        tot[key] = (tot[key] || 0) + r.a;
+      }
+    }
+  }
+  const letter = {};
+  Object.keys(tot).filter((k) => k.startsWith('p:')).sort((a, b) => tot[b] - tot[a])
+    .forEach((k, i) => { letter[k] = String.fromCharCode(65 + (i % 26)); });
+  const days = {};
+  for (const [date, m] of Object.entries(byDay)) {
+    const rows = Object.values(m).sort((a, b) => b.a - a.a || b.o - a.o).map(({ key, ...r }) => ({ ...r, l: letter[key] || '' }));
+    days[date] = { rows, n: rows.reduce((a, r) => a + r.n, 0), a: rows.reduce((a, r) => a + r.a, 0),
+      o: rows.reduce((a, r) => a + r.o, 0), la: rows.reduce((a, r) => a + r.la, 0), lr: rows.reduce((a, r) => a + r.lr, 0) };
+  }
+  return { days, has: Object.keys(days).length ? 1 : 0, from, to: anchorDate };
 }
 
 /*
