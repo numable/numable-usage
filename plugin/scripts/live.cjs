@@ -456,14 +456,23 @@ async function cmdDaemon() {
   let fast = true;                                         // 有会话在等授权 / 有待推的变化时 2 秒巡检一次
   let lastPush = 0, pushFailAt = 0;
   for (;;) {
-    await new Promise((r) => setTimeout(r, fast ? Math.min(BEAT_MS, 2000) : BEAT_MS));
+    // 可提前唤醒:慢巡检(15 秒)期间 hook 标了「有变化」就立刻处理 —— 否则会话结束 / 进入等授权要等满一个巡检周期才推
+    {
+      const wait = fast ? Math.min(BEAT_MS, 2000) : BEAT_MS;
+      const seen = (() => { try { return fs.statSync(DIRTY).mtimeMs; } catch { return 0; } })();
+      for (let t = 0; t < wait; t += 500) {
+        await new Promise((r) => setTimeout(r, Math.min(500, wait - t)));
+        let m = 0; try { m = fs.statSync(DIRTY).mtimeMs; } catch { /* */ }
+        if (m && m !== seen) break;
+      }
+    }
     if (!liveOn()) break;
     const cfg = readJson(CONFIG, null);
     const sync = syncOn(cfg);
     let dirtyAt = 0; try { dirtyAt = fs.statSync(DIRTY).mtimeMs; } catch { /* 没有待推的 */ }
     const release = lock(5000);
     if (!release) continue;
-    let busy = false, snapshot = null;
+    let busy = false, snapshot = null, permAny = false;
     try {
       const live = readJson(LIVE, null) || emptyLive();
       drain(live);
@@ -487,7 +496,7 @@ async function cmdDaemon() {
       }
       prune(live, now);
       writeJson(LIVE, live);
-      fast = Object.values(live.sessions).some((x) => x.state === 'perm') || (sync && dirtyAt > 0);
+      permAny = Object.values(live.sessions).some((x) => x.state === 'perm');
       snapshot = live;
     } finally { release(); }
     // 推送:有变化(合并 1.5 秒内的连续事件)立刻推;运行中 / 等授权每 60 秒心跳;失败 30 秒后再试
@@ -504,6 +513,8 @@ async function cmdDaemon() {
         } else pushFailAt = now;
       }
     }
+    // 推完再定下一轮快慢:还有等授权的会话(要尽快发现批准)或还有没推出去的变化 → 2 秒;否则按心跳慢巡检
+    fast = permAny || (sync && dirtyAt > 0);
     if (busy || (sync && dirtyAt)) idleSince = null;
     else if (idleSince == null) idleSince = Date.now();
     else if (Date.now() - idleSince > DAEMON_IDLE_MS) break;

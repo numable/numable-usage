@@ -278,14 +278,15 @@ test('上传体:超 60KB 先丢已结束会话的逐轮', () => {
 
 test('守护进程:打开同步后状态一变就推,推的体里没有提示词;没打开同步一个请求都不发', async () => {
   const got = [];
-  const srv = http.createServer((req, res) => { let b = ''; req.on('data', (c) => (b += c)).on('end', () => { got.push({ url: req.url, auth: req.headers.authorization, body: b }); res.end('{"ok":true}'); }); });
+  const srv = http.createServer((req, res) => { let b = ''; req.on('data', (c) => (b += c)).on('end', () => { got.push({ t: Date.now(), url: req.url, auth: req.headers.authorization, body: b }); res.end('{"ok":true}'); }); });
   await new Promise((r) => srv.listen(0, '127.0.0.1', r));
   const port = srv.address().port;
   const run = async (sync) => {
     const dir = tmp();
     fs.writeFileSync(path.join(dir, 'config.json'), JSON.stringify({ live: true, liveSync: sync, writeToken: 'W.tok', device: 'abc123' }));
     fs.writeFileSync(path.join(dir, 'history.json'), JSON.stringify({ salt: 'S', days: {} }));
-    const env = { ...process.env, NUMABLE_USAGE_STATE_DIR: dir, NUMABLE_USAGE_ENDPOINT: `http://127.0.0.1:${port}`, NUMABLE_LIVE_BEAT_MS: '200', NUMABLE_LIVE_IDLE_MS: '300' };
+    // 巡检周期故意设长(10 秒):推送必须靠「有变化就提前唤醒」,不能靠等到下一次巡检
+    const env = { ...process.env, NUMABLE_USAGE_STATE_DIR: dir, NUMABLE_USAGE_ENDPOINT: `http://127.0.0.1:${port}`, NUMABLE_LIVE_BEAT_MS: '10000', NUMABLE_LIVE_IDLE_MS: '300' };
     const hook = (payload) => new Promise((resolve) => {
       const p = spawn(process.execPath, [SCRIPT, '--hook'], { env, stdio: ['pipe', 'ignore', 'inherit'] });
       p.on('exit', resolve); p.stdin.end(JSON.stringify(payload));
@@ -293,6 +294,9 @@ test('守护进程:打开同步后状态一变就推,推的体里没有提示词
     await hook({ session_id: 's', hook_event_name: 'UserPromptSubmit', cwd: dir, prompt: 'SECRET-PROMPT' });
     await new Promise((r) => setTimeout(r, 2500));
     await hook({ session_id: 's', hook_event_name: 'Stop', last_assistant_message: 'SECRET-REPLY' });
+    const stopAt = Date.now();
+    for (let i = 0; i < 40 && !got.some((g) => g.t > stopAt && JSON.parse(g.body).sessions[0].state === 'input'); i++) await new Promise((r) => setTimeout(r, 100));
+    if (sync) assert.ok(got.some((g) => g.t > stopAt && JSON.parse(g.body).sessions[0].state === 'input'), '状态变化后 4 秒内没推出去(该提前唤醒却等了整个巡检周期)');
     // 等守护进程推完并空闲退出
     for (let i = 0; i < 40 && fs.existsSync(path.join(dir, 'live-daemon.pid')); i++) await new Promise((r) => setTimeout(r, 250));
     await new Promise((r) => setTimeout(r, 300));
