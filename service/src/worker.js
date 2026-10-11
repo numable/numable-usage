@@ -1076,6 +1076,19 @@ async function handle(req, env, ctx) {
 
   // ---- 实时会话(独立通道:每空间一个 Durable Object,不碰 D1)----
   // 令牌是 HMAC 派生的,本身就证明空间是本服务签发的 → 这里不查 D1(每分钟心跳若每次都查,读额度白烧)
+  // 手机登记 / 查询服务器通知(读令牌:这是用户自己的手机在登记自己;通知凭据由 Numable 通知中继发放)
+  if (p === '/live/notify' && (req.method === 'POST' || req.method === 'GET')) {
+    if (!env.LIVE) return err('live_disabled', 503);
+    const spaceId = await verifyToken(env, 'r', bearer(req));
+    if (!spaceId) return err('unauthorized', 401);
+    if (!(await allow(env, `ntf:${spaceId}`, 20))) return err('rate_limited', 429);
+    const stub = env.LIVE.get(env.LIVE.idFromName(spaceId));
+    if (req.method === 'GET') return stub.fetch('https://live/notify' + url.search);
+    const raw = await req.text();
+    if (raw.length > 4096) return err('payload_too_large', 413);
+    return stub.fetch('https://live/notify', { method: 'POST', body: raw, headers: { 'content-type': 'application/json' } });
+  }
+
   if (p === '/live' && (req.method === 'POST' || req.method === 'GET')) {
     if (!env.LIVE) return err('live_disabled', 503);
     const kind = req.method === 'POST' ? 'w' : 'r';

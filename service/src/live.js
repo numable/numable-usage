@@ -143,13 +143,126 @@ export function mergeLive(rows, now) {
   return { now, updatedAt, count, devices, sessions };
 }
 
+// ─────────────────────────── 服务器通知(P3 · doc/push-relay.md §4)───────────────────────────
+// 手机经 /live/notify 登记「通知中继凭据 + 阈值」;每收到一次电脑推送 / 到点 alarm 就判定,新事件立刻经中继发出。
+// 与 ?view=a 的区别:那边只回答「等得最久的一件」给手机定时检查用;这边逐会话、逐件发。
+export const NOTIFY_MAX_SUBS = 6;
+const SENT_KEEP = 300;
+
+function projLabels(merged) {
+  const label = {};
+  let li = 0;
+  for (const s of [...merged.sessions].sort((a, b) => a.startAt - b.startAt)) {
+    const k = s.proj || 'none';
+    if (!label[k]) { const L = LETTERS[li++ % 26]; label[k] = s.pname ? { z: s.pname, e: s.pname } : { z: `项目 ${L}`, e: `Project ${L}` }; }
+  }
+  return label;
+}
+
+/**
+ * 某个订阅此刻该发的事件(还没去重)。opts = { perm 分钟, long 分钟, wait / done / stuck 开关, lang },createdAt = 订阅时刻。
+ * - wait:等你授权 ≥ perm 分钟(订阅前就在等的也算 —— 你订阅时它还在等,正是要知道的)
+ * - done:一轮实跑 ≥ long 分钟、跑完仍在等你,且**跑完在订阅之后**(不翻旧账)
+ * - stuck:服务端判出可能卡住
+ */
+export function pushEvents(merged, opts, createdAt = 0) {
+  const now = merged.now, en = String(opts.lang || '').startsWith('en');
+  const perm = Number.isFinite(opts.perm) ? opts.perm : 3, long = Number.isFinite(opts.long) ? opts.long : 10;
+  const label = projLabels(merged);
+  const out = [];
+  for (const s of merged.sessions) {
+    const p = label[s.proj || 'none'], name = en ? p.e : p.z;
+    const path = `/session?sid=${s.sid}&dev=${s.dev}`;
+    if (opts.wait !== false && s.state === 'perm') {
+      const since = s.permSince || s.changedAt, m = Math.floor((now - since) / 60e3);
+      if (now - since >= perm * 60e3) out.push({ key: `w:${s.dev}:${s.sid}:${since}`, kind: 'wait', level: 'urgent', path, collapse: `w-${s.sid}`,
+        title: en ? `${name} needs your approval` : `${name} 在等你授权`, body: en ? `Waiting ${Math.max(1, m)} min` : `已经等了 ${Math.max(1, m)} 分钟` });
+    }
+    const t = s.turns[s.turns.length - 1];
+    if (opts.done !== false && s.state === 'input' && t && t.e && t.end === 'ok' && t.e > createdAt) {
+      const run = t.e - t.s - t.perm;
+      if (run >= long * 60e3) {
+        const m = Math.round(run / 60e3);
+        out.push({ key: `d:${s.dev}:${s.sid}:${t.n}`, kind: 'done', level: 'normal', path, collapse: `d-${s.sid}`,
+          title: en ? `${name} finished a long task` : `${name} 的长任务跑完了`, body: en ? `Ran ${m} min · your turn` : `跑了 ${m} 分钟，等你接着说` });
+      }
+    }
+    if (opts.stuck !== false && s.stuck) {
+      const w = stuckWhy(s.stuck);
+      out.push({ key: `s:${s.dev}:${s.sid}:${s.stuck.k}:${t ? t.n : 0}`, kind: 'stuck', level: 'normal', path, collapse: `s-${s.sid}`,
+        title: en ? `${name} may be stuck` : `${name} 可能卡住了`, body: en ? w[1] : w[0] });
+    }
+  }
+  return out;
+}
+
+/** 下一个「到点才成立」的时刻(等授权满 perm 分钟 / 满 15 分钟算卡住),给 alarm 用;没有返回 Infinity */
+export function nextDue(merged, subs) {
+  let t = Infinity;
+  for (const s of merged.sessions) {
+    if (s.state !== 'perm') continue;
+    const since = s.permSince || s.changedAt;
+    for (const sub of subs) {
+      if (sub.opts.wait !== false) { const d = since + (sub.opts.perm ?? 3) * 60e3; if (d > merged.now) t = Math.min(t, d); }
+      if (sub.opts.stuck !== false) { const d = since + STUCK.waitMin * 60e3 + 1000; if (d > merged.now) t = Math.min(t, d); }
+    }
+  }
+  return t;
+}
+
 /** 每个空间一个实例。存储:dev:<设备> → { at, skew, tier, sessions }。 */
 export class LiveSpace {
   constructor(ctx, env) {
     this.ctx = ctx;
     this.env = env;
     this.rows = null;
+    this.subs = null;
     this.win = 0; this.n = 0;
+  }
+
+  async loadSubs() {
+    if (this.subs) return this.subs;
+    this.subs = (await this.ctx.storage.get('subs')) || {};
+    return this.subs;
+  }
+
+  /** 判定 + 发送;返回下一个到点时刻。中继 410 = 凭据已撤销 / 设备没了 → 删掉这条订阅。 */
+  async notify(now) {
+    const subs = await this.loadSubs();
+    const ids = Object.keys(subs);
+    if (!ids.length) return Infinity;
+    const merged = mergeLive(this.rows || {}, now);
+    let dirty = false;
+    for (const id of ids) {
+      const sub = subs[id];
+      for (const ev of pushEvents(merged, sub.opts, sub.createdAt)) {
+        if (sub.sent.includes(ev.key)) continue;
+        let status = 0;
+        try {
+          const r = await fetch(`${this.env.PUSH_RELAY || 'https://api.numable.app'}/push/send`, {
+            method: 'POST', headers: { 'content-type': 'application/json', authorization: `Push ${sub.handle}` },
+            body: JSON.stringify({ title: ev.title, body: ev.body, path: ev.path, level: ev.level, collapse: ev.collapse }),
+            signal: AbortSignal.timeout(5000),
+          });
+          status = r.status;
+        } catch { status = 0; }
+        if (status === 200) { sub.sent.push(ev.key); if (sub.sent.length > SENT_KEEP) sub.sent.splice(0, sub.sent.length - SENT_KEEP); sub.lastSentAt = now; dirty = true; }
+        else if (status === 410) { delete subs[id]; dirty = true; break; }
+        // 429 / 5xx / 网络:不记已发,下一轮再试
+      }
+    }
+    if (dirty) await this.ctx.storage.put('subs', subs);
+    return nextDue(merged, Object.values(subs));
+  }
+
+  async schedule(now, due) {
+    const rows = this.rows || {};
+    const ats = Object.values(rows).map((r) => r.at);
+    const cleanup = ats.length ? Math.min(...ats) + KEEP_MS + 60e3 : Infinity;
+    const t = Math.min(cleanup, due);
+    if (t === Infinity) return;
+    const cur = await this.ctx.storage.getAlarm();
+    if (!cur || t < cur || cur <= now) await this.ctx.storage.setAlarm(Math.max(t, now + 1000));
   }
 
   async load() {
@@ -165,6 +278,28 @@ export class LiveSpace {
     const now = Date.now();
     const rows = await this.load();
 
+    // 手机登记 / 取消服务器通知(读令牌鉴权,worker 已验):{ id, on, handle?, perm?, long?, wait?, done?, stuck?, lang? }
+    if (req.method === 'POST' && url.pathname === '/notify') {
+      let b; try { b = await req.json(); } catch { return Response.json({ error: 'bad_json' }, { status: 400 }); }
+      const id = typeof b.id === 'string' && /^[A-Za-z0-9_-]{8,40}$/.test(b.id) ? b.id : null;
+      if (!id) return Response.json({ error: 'bad_id' }, { status: 400 });
+      const subs = await this.loadSubs();
+      if (b.on === false) { delete subs[id]; await this.ctx.storage.put('subs', subs); return Response.json({ ok: true, on: false }); }
+      if (typeof b.handle !== 'string' || !/^ph1\.[A-Za-z0-9_-]{16,64}$/.test(b.handle)) return Response.json({ error: 'bad_handle' }, { status: 400 });
+      if (!subs[id] && Object.keys(subs).length >= NOTIFY_MAX_SUBS) return Response.json({ error: 'too_many' }, { status: 409 });
+      const num = (v, d, lo, hi) => (Number.isFinite(Number(v)) ? Math.min(hi, Math.max(lo, Number(v))) : d);
+      const prev = subs[id];
+      subs[id] = {
+        handle: b.handle, createdAt: prev && prev.handle === b.handle ? prev.createdAt : now, sent: prev ? prev.sent : [], lastSentAt: prev ? prev.lastSentAt || 0 : 0,
+        opts: { perm: num(b.perm, 3, 0, 240), long: num(b.long, 10, 1, 600), wait: b.wait !== false, done: b.done !== false, stuck: b.stuck !== false,
+          lang: typeof b.lang === 'string' && /^[a-z]{2}(-[A-Za-z]{2,4})?$/.test(b.lang) ? b.lang : 'zh-CN' },
+      };
+      await this.ctx.storage.put('subs', subs);
+      const due = await this.notify(now);
+      await this.schedule(now, due);
+      return Response.json({ ok: true, on: true, opts: subs[id].opts });
+    }
+
     if (req.method === 'POST') {
       const w = Math.floor(now / 60000);
       if (w !== this.win) { this.win = w; this.n = 0; }
@@ -179,8 +314,14 @@ export class LiveSpace {
       const row = { at: now, skew: Math.abs(skew) < 1500 ? 0 : skew, tier: clean.tier, sessions: clean.sessions };
       rows[dev] = row;
       await this.ctx.storage.put('dev:' + dev, row);
-      if (!(await this.ctx.storage.getAlarm())) await this.ctx.storage.setAlarm(now + KEEP_MS + 60e3);
+      const due = await this.notify(now);
+      await this.schedule(now, due);
       return Response.json({ ok: true, sessions: clean.sessions.length });
+    }
+
+    if (req.method === 'GET' && url.pathname === '/notify') {
+      const subs = await this.loadSubs(), sub = subs[url.searchParams.get('id') || ''];
+      return Response.json(sub ? { on: true, opts: sub.opts, lastSentAt: sub.lastSentAt || 0 } : { on: false }, { headers: { 'cache-control': 'no-store' } });
     }
 
     if (req.method === 'GET') {
@@ -210,10 +351,9 @@ export class LiveSpace {
     for (const [dev, row] of Object.entries(rows)) {
       if (now - row.at > KEEP_MS) { delete rows[dev]; await this.ctx.storage.delete('dev:' + dev); }
     }
-    if (Object.keys(rows).length) {
-      const oldest = Math.min(...Object.values(rows).map((r) => r.at));
-      await this.ctx.storage.setAlarm(oldest + KEEP_MS + 60e3);
-    }
+    // 到点的「等授权满 N 分钟」在这里发出(电脑那边此时可能一直没有新推送)
+    const due = await this.notify(now);
+    await this.schedule(now, due);
   }
 }
 

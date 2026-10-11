@@ -405,5 +405,75 @@ console.log('\n── 实时会话 /live ──');
   ok(limited, '每空间每分钟写入限流');
 }
 
+console.log('\n── 服务器通知(P3)──');
+{
+  // 假中继:记下服务端发来的每一条;按凭据决定回 200 / 410
+  const http = await import('node:http');
+  const got = []; const gone = new Set();
+  const relay = http.createServer((req, res) => { let b = ''; req.on('data', (c) => (b += c)).on('end', () => {
+    const h = (req.headers.authorization || '').replace('Push ', '');
+    got.push({ path: req.url, handle: h, body: JSON.parse(b || '{}') });
+    res.writeHead(gone.has(h) ? 410 : 200, { 'content-type': 'application/json' }); res.end('{}'); }); });
+  await new Promise((r) => relay.listen(8790, '127.0.0.1', r));
+  try {
+    // 复用上面「跨空间删除」那个空间(没有实时数据):/space 每 IP 每分钟限 5 个,本文件已建满
+    const W3 = other.j && other.j.writeToken, R3 = other.j && other.j.readToken;
+    if (!W3) { ok(false, '建空间被限流,跳过本节(稍后重跑)'); }
+    else {
+      const now = Date.now(), M = 60e3;
+      const H1 = 'ph1.' + 'a'.repeat(32), H2 = 'ph1.' + 'b'.repeat(32);
+      const lp = (dev, sessions) => J('/live?dev=' + dev, { method: 'POST', headers: { 'content-type': 'application/json', authorization: 'Bearer ' + W3 }, body: JSON.stringify({ tier: 2, devNow: Date.now(), sessions }) });
+      const nt = (b) => J('/live/notify', { method: 'POST', headers: { 'content-type': 'application/json', authorization: 'Bearer ' + R3 }, body: JSON.stringify(b) });
+      const base = { proj: 'abcdef1234', pname: 'Numable', changedAt: now - M, changeKind: 'turn', startAt: now - 60 * M, lastAt: now, beatAt: now, model: null, tools: 1, errors: 0, compactions: 0, subs: [] };
+      const tn = (o) => ({ n: 1, s: now - 20 * M, e: null, perm: 0, tools: 3, seq: 's3', cells: '', long: null, out: 1, in: 1, cw: 1, end: null, ...o });
+      // 订阅前就跑完的长任务:不该发(不翻旧账)
+      await lp('ee11', [{ ...base, sid: 'cccc0001', state: 'input', changedAt: now - 2 * M, turns: [tn({ e: now - 2 * M, end: 'ok' })] }]);
+      ok((await nt({ id: 'phone-aaaa1', handle: 'bad' })).s === 400, '凭据格式不对 → 400');
+      ok((await J('/live/notify', { method: 'POST', headers: { authorization: 'Bearer ' + W3 }, body: '{}' })).s === 401, '用写令牌登记 → 401(登记是手机的事)');
+      const r1 = await nt({ id: 'phone-aaaa1', handle: H1, perm: 0, long: 10, lang: 'zh-CN' });
+      ok(r1.s === 200 && r1.j.on === true && r1.j.opts.perm === 0, '手机登记成功');
+      ok(got.length === 0, `✦ 订阅前就跑完的那轮不发(${got.length})`);
+      // 等授权 + 卡住(连续失败)
+      await lp('ee11', [
+        { ...base, sid: 'cccc0002', state: 'perm', permSince: now - 30e3, changedAt: now - 30e3, turns: [tn({ n: 2 })] },
+        { ...base, sid: 'cccc0003', state: 'running', fs: 6, turns: [tn({ n: 4 })] },
+      ]);
+      const kinds = got.map((g) => g.body.title).sort();
+      ok(got.length === 2 && kinds.some((t) => t === 'Numable 在等你授权') && kinds.some((t) => t === 'Numable 可能卡住了'), `✦ 收到推送即判定,立刻发(${JSON.stringify(kinds)})`);
+      ok(got.every((g) => g.path === '/push/send' && g.handle === H1), '经中继 /push/send,带这台手机的凭据');
+      const w = got.find((g) => g.body.title.includes('等你授权'));
+      ok(w && w.body.level === 'urgent' && w.body.path === '/session?sid=cccc0002&dev=ee11' && /^已经等了 1 分钟$/.test(w.body.body), `等授权:紧急、点开进那个会话(${w && w.body.path})`);
+      // 同一件事不重复
+      await lp('ee11', [
+        { ...base, sid: 'cccc0002', state: 'perm', permSince: now - 30e3, changedAt: now - 30e3, turns: [tn({ n: 2 })] },
+        { ...base, sid: 'cccc0003', state: 'running', fs: 7, turns: [tn({ n: 4 })] },
+      ]);
+      ok(got.length === 2, `✦ 同一件事只发一次(${got.length})`);
+      // 第二台手机,英文,只要长任务;跑完一轮长任务 → 只有它收到英文的
+      await nt({ id: 'phone-bbbb2', handle: H2, wait: false, stuck: false, long: 10, lang: 'en-US' });
+      await lp('ee11', [{ ...base, sid: 'cccc0004', state: 'input', changedAt: Date.now(), turns: [tn({ n: 5, s: now - 15 * M, e: Date.now(), end: 'ok' })] }]);
+      const fresh = got.slice(2);
+      ok(fresh.length === 2 && fresh.some((g) => g.handle === H2 && g.body.title === 'Numable finished a long task') && fresh.some((g) => g.handle === H1 && g.body.title === 'Numable 的长任务跑完了'),
+        `✦ 每台手机按自己的开关与语言收(${JSON.stringify(fresh.map((g) => [g.handle.slice(4, 5), g.body.title]))})`);
+      // 到点:等授权 1 分钟阈值,开始等时还差 2 秒 → 没发;alarm 到点后发
+      await nt({ id: 'phone-bbbb2', on: false });
+      await nt({ id: 'phone-aaaa1', handle: H1, perm: 1, stuck: false, done: false });
+      const before = got.length;
+      const since = Date.now() - 58e3;
+      await lp('ee11', [{ ...base, sid: 'cccc0005', state: 'perm', permSince: since, changedAt: since, turns: [tn({ n: 6 })] }]);
+      ok(got.length === before, '还差两秒到阈值:先不发');
+      await new Promise((r) => setTimeout(r, 6000));
+      ok(got.length === before + 1 && got[got.length - 1].body.title.includes('等你授权'), `✦ 到点由 alarm 发出(电脑没有新推送也会发)(${got.length - before})`);
+      // 中继说凭据失效 → 删订阅,之后不再发
+      gone.add(H1);
+      const st = await J('/live/notify?id=phone-aaaa1', { headers: { authorization: 'Bearer ' + R3 } });
+      ok(st.j && st.j.on === true, '凭据失效前订阅还在');
+      await lp('ee11', [{ ...base, sid: 'cccc0007', state: 'perm', permSince: now - 10 * M, changedAt: now - 10 * M, turns: [tn({ n: 8 })] }]);
+      const st2 = await J('/live/notify?id=phone-aaaa1', { headers: { authorization: 'Bearer ' + R3 } });
+      ok(st2.j && st2.j.on === false, '✦ 中继回 410 → 这条订阅被删掉');
+    }
+  } finally { relay.close(); }
+}
+
 console.log(`\n${fail === 0 ? '✅' : '❌'}  pass ${pass} · fail ${fail}\n`);
 process.exit(fail ? 1 : 0);
