@@ -158,7 +158,18 @@ export class LiveSpace {
       return Response.json({ ok: true, sessions: clean.sessions.length });
     }
 
-    if (req.method === 'GET') return Response.json(mergeLive(rows, now), { headers: { 'cache-control': 'no-store' } });
+    if (req.method === 'GET') {
+      const merged = mergeLive(rows, now);
+      if (url.searchParams.get('view') === 'w') {
+        const n = (k) => Number(url.searchParams.get(k));
+        // 时区:取数流把「看的人那台设备此刻的时分」(lt=HHmm)与 ms 一起带来,这里反推 UTC 偏移 ——
+        // 取数流里做不了可靠的时区算术,而组件上要写本地时刻(「15:36 起」「截至 15:42」)
+        const tzo = Number.isFinite(n('tzo')) && url.searchParams.has('tzo') ? n('tzo') : tzoOf(url.searchParams.get('lt'), n('ms'));
+        return Response.json({ updatedAt: merged.updatedAt, w: widgetView(merged, { win: n('win'), tzo, rows: n('rows') || 8, lanes: n('lanes') || 10 }) },
+          { headers: { 'cache-control': 'no-store' } });
+      }
+      return Response.json(merged, { headers: { 'cache-control': 'no-store' } });
+    }
     return Response.json({ error: 'not_found' }, { status: 404 });
   }
 
@@ -174,4 +185,171 @@ export class LiveSpace {
       await this.ctx.storage.setAlarm(oldest + KEEP_MS + 60e3);
     }
   }
+}
+
+// ─────────────────────────── 组件视图(?view=w)───────────────────────────
+// 同 worker.js widgetsView 的惯例:服务端把要画的东西算好(位置是 0~1 的比例、颜色是「浅|深」串、
+// 文字中英各一份 z / e,RCN 按 @i18n.lang 挑),RCN 只负责摆。状态词表与颜色 = 设计 §1.4。
+const C = {
+  run: '#C15F3C|#E8916B',                       // 强调色 = 运行中(本包 Claude 暖橙);任何工具类目都不用它
+  wait: '#C98A00|#F5C242', waitBg: '#FBF1D6|#3A3015',
+  stop: '#A1A1AA|#5B5B63', track: '#F1EEEC|#2A2725',
+  cat: { r: '#4F7BE0|#7D9BEF', e: '#2F9E5B|#4CC27A', s: '#5B6B7F|#8E9BB0', a: '#8B6FD6|#A792EC', w: '#3D8BD9|#5FA5EC',
+    b: '#1F9BB0|#3CB9CD', d: '#9C6B3F|#C7925F', m: '#8D96A3|#6E7782', q: '#C98A00|#F5C242', o: '#A1A1AA|#6E6E76' },
+};
+const ST = {
+  running: { ic: '▶', z: '运行中', e: 'Running', c: C.run },
+  perm: { ic: '⚠', z: '等你授权', e: 'Needs approval', c: C.wait },
+  input: { ic: '⏸', z: '等你输入', e: 'Your turn', c: C.wait },
+  parked: { ic: '⏸', z: '搁置', e: 'Idle', c: C.stop },
+  lost: { ic: '✕', z: '可能已断开', e: 'Disconnected?', c: C.stop },
+  ended: { ic: '■', z: '已结束', e: 'Ended', c: C.stop },
+};
+const DOING = { r: ['读代码', 'Reading code'], e: ['改代码', 'Editing'], s: ['跑命令', 'Running commands'], a: ['派子代理', 'Running agents'],
+  w: ['查资料', 'Searching the web'], b: ['操作浏览器', 'Using the browser'], d: ['操作设备', 'Driving a device'], m: ['调外部工具', 'Calling tools'],
+  q: ['问你', 'Asking you'], o: ['干活', 'Working'] };
+const ORDER = { perm: 0, input: 1, running: 2, parked: 3, lost: 4, ended: 5 };
+const LETTERS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+
+const kfmt = (n) => (n >= 1e9 ? (n / 1e9).toFixed(1) + 'B' : n >= 1e6 ? (n / 1e6).toFixed(1) + 'M' : n >= 1e3 ? Math.round(n / 1e3) + 'k' : String(n));
+const dfmt = (ms) => { const m = Math.floor(ms / 60e3); return m < 1 ? '<1m' : m < 60 ? `${m}m` : `${Math.floor(m / 60)}h${String(m % 60).padStart(2, '0')}`; };
+const hhmm = (ms, tzo) => { const d = new Date(ms + tzo * 60e3); return `${String(d.getUTCHours()).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')}`; };
+const r3 = (x) => Math.round(x * 1000) / 1000;
+const totTok = (s) => s.turns.reduce((a, t) => a + t.out + t.in + t.cw, 0);
+const runMs = (s, now) => s.turns.reduce((a, t) => a + Math.max(0, (t.e || now) - t.s - t.perm), 0) - (s.permSince ? Math.max(0, now - s.permSince) : 0);
+const lastCat = (s) => { const t = s.turns[s.turns.length - 1]; const m = t && t.seq.match(/([a-z])\d+$/); return m ? m[1] : 'o'; };
+/** 「这个状态从什么时候起」:运行中 = 本轮开始;其余 = 状态切换时刻 */
+const sinceOf = (s) => (s.state === 'running' && s.turns.length && !s.turns[s.turns.length - 1].e ? s.turns[s.turns.length - 1].s : s.changedAt);
+
+/**
+ * opts:win = 时间窗小时数(1 / 2 / 6 / 24),tzo = 看的人的 UTC 偏移(分钟),rows / lanes = 各档容量。
+ * 组件上一律写起点时刻(「10:38 起」)而不是时长 —— 组件一画就挂几分钟,时长会过期,起点不会(设计 §5.5)。
+ */
+/** lt = 本地「时分」四位(如 1542),ms = 同一时刻的毫秒 → UTC 偏移(分钟,按 15 分钟取整)。拿不到返回 0。 */
+export function tzoOf(lt, ms) {
+  if (!/^\d{4}$/.test(lt || '') || !Number.isFinite(ms) || ms <= 0) return 0;
+  const local = Number(lt.slice(0, 2)) * 60 + Number(lt.slice(2));
+  const utc = Math.floor(ms / 60e3) % 1440;
+  let d = ((local - utc) % 1440 + 1440) % 1440;
+  if (d > 840) d -= 1440;                      // 偏移范围 −12:00 ~ +14:00
+  return Math.round(d / 15) * 15;
+}
+
+export function widgetView(merged, opts = {}) {
+  const now = merged.now;
+  const tzo = Number.isFinite(opts.tzo) ? Math.max(-840, Math.min(840, opts.tzo)) : 0;
+  const winH = [1, 2, 6, 24].includes(opts.win) ? opts.win : 2;
+  const winMs = winH * 3600e3, w0 = now - winMs;
+  const xs = (t) => r3(Math.max(0, Math.min(1, (t - w0) / winMs)));
+
+  // 项目:有名字用名字;没有就按首次出现顺序叫「项目 A / B」
+  const projLabel = {};
+  let li = 0;
+  for (const s of [...merged.sessions].sort((a, b) => a.startAt - b.startAt)) {
+    const k = s.proj || 'none';
+    if (!projLabel[k]) {
+      const L = LETTERS[li++ % 26];
+      projLabel[k] = s.pname ? { z: s.pname, e: s.pname } : { z: `项目 ${L}`, e: `Project ${L}` };
+    }
+  }
+  // 同项目内的会话编号(按开始先后):#1 #2 …,跨设备时带设备尾标
+  const multiDev = merged.devices.length > 1;
+  const devTag = {}; merged.devices.forEach((d, i) => { devTag[d.dev] = String.fromCharCode(97 + i); });
+  const seqNo = {};
+  const label = {};
+  for (const s of [...merged.sessions].sort((a, b) => a.startAt - b.startAt)) {
+    const k = s.proj || 'none';
+    seqNo[k] = (seqNo[k] || 0) + 1;
+    label[s.dev + s.sid] = `#${seqNo[k]}` + (multiDev ? `/${devTag[s.dev]}` : '');
+  }
+
+  const row = (s) => {
+    const st = ST[s.state] || ST.input;
+    const since = sinceOf(s);
+    const p = projLabel[s.proj || 'none'];
+    const dz = DOING[lastCat(s)] || DOING.o;
+    let tz, te;
+    if (s.state === 'running') { tz = s.title || `正在${dz[0]}`; te = s.title || dz[1]; }
+    else if (s.state === 'perm' || s.state === 'input') { tz = `${st.z} · ${hhmm(since, tzo)} 起`; te = `${st.e} · since ${hhmm(since, tzo)}`; }
+    else { tz = s.title ? `${st.z} · ${s.title}` : st.z; te = s.title ? `${st.e} · ${s.title}` : st.e; }
+    return {
+      st: s.state, ic: st.ic, c: st.c, warn: s.state === 'perm' || s.state === 'input' ? 1 : 0,
+      pz: p.z, pe: p.e, lab: label[s.dev + s.sid], tz, te,
+      at: hhmm(since, tzo), turns: s.turns.length ? s.turns[s.turns.length - 1].n : 0,
+      run: dfmt(runMs(s, now)), tok: kfmt(totTok(s)), dim: s.state === 'ended' || s.state === 'parked' || s.state === 'lost' ? 1 : 0,
+    };
+  };
+
+  // ── 概况行:等你授权 > 等你输入 > 运行中 > 其余;已结束只留 30 分钟内的 ──
+  const shown = merged.sessions.filter((s) => s.state !== 'ended' || now - s.changedAt < 30 * 60e3);
+  const board = [...shown].sort((a, b) => ORDER[a.state] - ORDER[b.state] || b.changedAt - a.changedAt)
+    .slice(0, opts.rows || 8).map((s, i) => ({ i, ...row(s) }));
+
+  // ── 多泳道:工程为池(按池内最新变化排)、会话为道(池内按开始时刻,位置不随状态变)──
+  const inWin = merged.sessions.filter((s) => (s.endAt || now) >= w0);
+  const pools = {};
+  for (const s of inWin) (pools[s.proj || 'none'] || (pools[s.proj || 'none'] = [])).push(s);
+  const poolList = Object.entries(pools)
+    .map(([k, list]) => ({ k, list: list.sort((a, b) => a.startAt - b.startAt), changed: Math.max(...list.map((x) => x.changedAt)),
+      wait: list.filter((x) => x.state === 'perm' || x.state === 'input').length }))
+    .sort((a, b) => b.changed - a.changed);
+  const lanes = [];
+  let hidden = 0;
+  for (const pool of poolList) {
+    if (lanes.length + pool.list.length > (opts.lanes || 10)) { hidden++; continue; }
+    pool.list.forEach((s, j) => {
+      const segs = [];
+      for (const t of s.turns) {
+        const te = t.e || now;
+        if (te < w0) continue;
+        // 每 2 分钟一格的主要类目 → 连成段;没有格子(旧数据 / 只有一个工具)就整轮按最后一个类目画
+        const cells = t.cells || (t.seq.match(/[a-z]/g) || ['o']).slice(-1).join('');
+        const slot = 120e3;
+        let i = 0;
+        while (i < cells.length) {
+          let j2 = i; while (j2 + 1 < cells.length && cells[j2 + 1] === cells[i]) j2++;
+          const a = Math.max(t.s + i * slot, t.s), b = Math.min(t.s + (j2 + 1) * slot, te);
+          if (cells[i] !== '.' && b > w0 && b > a) segs.push({ x: xs(a), w: r3(xs(b) - xs(a)), c: C.cat[cells[i]] || C.cat.o, k: cells[i] });
+          i = j2 + 1;
+        }
+        if (!t.cells && !segs.length) segs.push({ x: xs(t.s), w: r3(xs(te) - xs(t.s)), c: C.cat.o, k: 'o' });
+      }
+      // 运行中:最后一块一直顶到现在线(那一格里还没调到下一个工具,但它确实在跑)
+      if (s.state === 'running' && segs.length) { const L = segs[segs.length - 1]; L.w = r3(1 - L.x); }
+      // 尾巴 = 最后一个事件到现在,只按状态画(§5.4)
+      let tail = null, cap = -1;
+      if (s.state === 'perm') tail = { x: xs(s.permSince || s.changedAt), k: 'perm' };
+      else if (s.state === 'input' || s.state === 'parked') tail = { x: xs(s.changedAt), k: s.state };
+      else if (s.state === 'lost') tail = { x: xs(Math.max(s.beatAt || 0, s.lastAt || 0)), k: 'lost' };
+      else if (s.state === 'ended') cap = xs(s.endAt || s.changedAt);
+      if (tail) tail.w = r3(1 - tail.x);
+      const st = ST[s.state] || ST.input;
+      const since = sinceOf(s);
+      lanes.push({
+        i: lanes.length, first: j === 0 ? 1 : 0, sub: 0,
+        pz: projLabel[pool.k].z, pe: projLabel[pool.k].e, pw: j === 0 ? pool.wait : 0,
+        lab: label[s.dev + s.sid], st: s.state, ic: st.ic, c: st.c, dim: s.state === 'ended' ? 1 : 0,
+        segs, tail, cap, running: s.state === 'running' ? 1 : 0,
+        chip: s.state === 'ended' ? '' : hhmm(since, tzo),
+      });
+    });
+  }
+  // 摊平:RCN 里循环套循环(道 × 段)的作用域不可靠,段 / 尾巴 / 端帽各一张平表,带道号 i
+  const flat = { segs: [], tails: [], caps: [] };
+  for (const l of lanes) {
+    for (const g of l.segs) flat.segs.push({ i: l.i, x: g.x, w: g.w, c: g.c });
+    if (l.tail) flat.tails.push({ i: l.i, ...l.tail });
+    if (l.cap >= 0) flat.caps.push({ i: l.i, x: l.cap });
+  }
+  const c = merged.count;
+  return {
+    has: merged.sessions.length ? 1 : 0, upd: merged.updatedAt ? hhmm(merged.updatedAt, tzo) : '',
+    n: { par: c.parallel, run: c.running, perm: c.perm, input: c.input, wait: c.perm + c.input,
+      proj: new Set(merged.sessions.filter((s) => ['running', 'perm', 'input'].includes(s.state)).map((s) => s.proj || 'none')).size },
+    board, more: Math.max(0, shown.length - board.length), nb: shown.length, devs: merged.devices.length,
+    lanes, hiddenPools: hidden, winH, flat, nl: lanes.length, n4: Math.min(lanes.length, 4), n10: Math.min(lanes.length, 10),   // 实际画几道:RCN 尺寸字段里不能写方法
+    axis: [hhmm(w0, tzo), hhmm(w0 + winMs / 2, tzo), hhmm(now, tzo)], a0: hhmm(w0, tzo), a1: hhmm(w0 + winMs / 2, tzo), a2: hhmm(now, tzo),
+    m42: Math.max(0, shown.length - 3) * (shown.length > 4 ? 1 : 0), m44: Math.max(0, shown.length - 7) * (shown.length > 8 ? 1 : 0),
+    color: C,
+  };
 }
