@@ -979,4 +979,4 @@ if (require.main === module) {
 }
 
 // 供测试用（hook 直接执行本文件，走上面那条）
-module.exports = { absorb, isHumanPrompt, scan, loadHistory, buildPayload, foldWindows, acquireLock, tryLock, emptyDay, ghostOf, activeMinutes, flushAct, touchSession, countLines };
+module.exports = { deviceId, absorb, isHumanPrompt, scan, loadHistory, buildPayload, foldWindows, acquireLock, tryLock, emptyDay, ghostOf, activeMinutes, flushAct, touchSession, countLines };

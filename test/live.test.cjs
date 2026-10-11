@@ -217,3 +217,96 @@ test('后台子代理:主轮结束后子代理的工具调用不开新轮;它弹
   assert.equal(s.state, 'input');
   assert.equal(s.subs[0].tools, 1);
 });
+
+// ---------- P1:上传 ----------
+const crypto = require('node:crypto');
+const http = require('node:http');
+
+function mkLive() {
+  const live = L.emptyLive();
+  const dir = tmp(); fs.mkdirSync(path.join(dir, '.git'));
+  const wt = path.join(dir, '.claude', 'worktrees', 'wt2'); fs.mkdirSync(wt, { recursive: true });
+  const base = { cwd: wt, transcript_path: '/Users/me/secret/t.jsonl', session_title: '修 https://x.com/a?token=1 和 me@mail.com 的 sk-abcdefgh12345 问题' };
+  // 真实 hook 每个事件都带本会话的 cwd
+  for (const e of [ev('SessionStart', base), ev('UserPromptSubmit', { ...base, prompt: 'SECRET PROMPT' }),
+    ev('PreToolUse', { ...base, tool_name: 'Read', tool_use_id: 'r1', tool_input: { file_path: '/Users/me/secret.txt' } }),
+    ev('PostToolUse', { ...base, tool_name: 'Read', tool_use_id: 'r1', duration_ms: 30 })]) L.reduce(live, e);
+  return { live, root: dir };
+}
+
+test('上传体:L1 只有结构与匿名编号;项目编号与用量那边同一把盐同一个根', () => {
+  const { live, root } = mkLive();
+  const body = L.buildLivePayload(live, { salt: 'S', now: clock + 1000, alive: ALIVE });
+  const blob = JSON.stringify(body);
+  assert.equal(body.tier, 1);
+  assert.doesNotMatch(blob, /SECRET|secret|\/Users|wt2|token|mail|修/);
+  const x = body.sessions[0];
+  assert.notEqual(x.sid, 's1');
+  assert.equal(x.proj, crypto.createHash('sha256').update('S|' + root).digest('hex').slice(0, 10));   // = collect.cjs projectOf
+  assert.equal(x.pname, undefined); assert.equal(x.title, undefined);
+  assert.equal(x.turns[0].seq, 'r1');
+  assert.equal(x.turns[0].cells, 'r');
+});
+
+test('上传体:names → 项目文件夹名(worktree 归回项目);titles → 本机脱敏后的标题', () => {
+  const { live, root } = mkLive();
+  const x = L.buildLivePayload(live, { salt: 'S', names: true, titles: true, now: clock, alive: ALIVE }).sessions[0];
+  assert.equal(x.pname, path.basename(root));
+  assert.doesNotMatch(x.title, /https|mail\.com|sk-abc/);
+  assert.match(x.title, /^修 … 和 … 的 … 问题$/);
+});
+
+test('上传体:进程没了按断开上报;等你输入不论多久都报 input(搁置由服务端按时刻推)', () => {
+  const { live } = mkLive();
+  assert.equal(L.buildLivePayload(live, { salt: 'S', now: clock, alive: DEAD }).sessions[0].state, 'lost');
+  L.reduce(live, ev('Stop'));
+  assert.equal(L.buildLivePayload(live, { salt: 'S', now: clock + 3600e3, alive: ALIVE }).sessions[0].state, 'input');
+});
+
+test('上传体:超 60KB 先丢已结束会话的逐轮', () => {
+  const live = L.emptyLive();
+  for (let i = 0; i < 30; i++) {
+    const sid = 'x' + i;
+    for (let k = 0; k < 60; k++) { L.reduce(live, { ...ev('UserPromptSubmit'), session_id: sid }); L.reduce(live, { ...ev('Stop'), session_id: sid }); }
+    L.reduce(live, { ...ev('SessionEnd'), session_id: sid });
+  }
+  L.reduce(live, { ...ev('UserPromptSubmit'), session_id: 'active' });
+  const body = L.buildLivePayload(live, { salt: 'S', now: clock, alive: ALIVE });
+  assert.ok(Buffer.byteLength(JSON.stringify(body)) <= 60 * 1024);
+  assert.equal(body.sessions.find((x) => x.state === 'running').turns.length, 1);   // 活跃会话的逐轮不动
+});
+
+test('守护进程:打开同步后状态一变就推,推的体里没有提示词;没打开同步一个请求都不发', async () => {
+  const got = [];
+  const srv = http.createServer((req, res) => { let b = ''; req.on('data', (c) => (b += c)).on('end', () => { got.push({ url: req.url, auth: req.headers.authorization, body: b }); res.end('{"ok":true}'); }); });
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  const port = srv.address().port;
+  const run = async (sync) => {
+    const dir = tmp();
+    fs.writeFileSync(path.join(dir, 'config.json'), JSON.stringify({ live: true, liveSync: sync, writeToken: 'W.tok', device: 'abc123' }));
+    fs.writeFileSync(path.join(dir, 'history.json'), JSON.stringify({ salt: 'S', days: {} }));
+    const env = { ...process.env, NUMABLE_USAGE_STATE_DIR: dir, NUMABLE_USAGE_ENDPOINT: `http://127.0.0.1:${port}`, NUMABLE_LIVE_BEAT_MS: '200', NUMABLE_LIVE_IDLE_MS: '300' };
+    const hook = (payload) => new Promise((resolve) => {
+      const p = spawn(process.execPath, [SCRIPT, '--hook'], { env, stdio: ['pipe', 'ignore', 'inherit'] });
+      p.on('exit', resolve); p.stdin.end(JSON.stringify(payload));
+    });
+    await hook({ session_id: 's', hook_event_name: 'UserPromptSubmit', cwd: dir, prompt: 'SECRET-PROMPT' });
+    await new Promise((r) => setTimeout(r, 2500));
+    await hook({ session_id: 's', hook_event_name: 'Stop', last_assistant_message: 'SECRET-REPLY' });
+    // 等守护进程推完并空闲退出
+    for (let i = 0; i < 40 && fs.existsSync(path.join(dir, 'live-daemon.pid')); i++) await new Promise((r) => setTimeout(r, 250));
+    await new Promise((r) => setTimeout(r, 300));
+  };
+  try {
+    await run(false);
+    assert.equal(got.length, 0, '没打开同步却发了请求');
+    await run(true);
+  } finally { srv.close(); }   // 断言失败也要关,否则测试进程挂住不退
+  assert.ok(got.length >= 2, `应至少推两次(开始跑、跑完),实际 ${got.length}`);
+  assert.equal(got[0].url, '/live?dev=abc123');
+  assert.equal(got[0].auth, 'Bearer W.tok');
+  const states = got.map((g) => JSON.parse(g.body).sessions[0].state);
+  assert.equal(states[0], 'running');
+  assert.equal(states[states.length - 1], 'input');
+  assert.doesNotMatch(got.map((g) => g.body).join(''), /SECRET/);
+});

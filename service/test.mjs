@@ -270,5 +270,67 @@ const big = { source: 'claude-code', device: 'aabbcc112233',
 ok((await post('/ingest', big, writeToken)).s === 413, '超 256KB → 413');
 ok((await post('/ingest', { source: 'nope', snapshot: {} }, writeToken)).s === 400, '未知 source → 400');
 
+
+console.log('\n── 实时会话 /live ──');
+{
+  // 复用开头建的空间:/space 每 IP 每分钟限 5 个,前面的用例已经建过几个
+  const W = writeToken, R = readToken;
+  const now = Date.now();
+  const turn = (o = {}) => ({ n: 1, s: now - 60e3, e: null, perm: 0, tools: 3, seq: 'r2s1', cells: 'rs', long: ['s', 1200], out: 10, in: 1, cw: 5, end: null, ...o });
+  const sess = (o = {}) => ({ sid: 'a1b2c3d4', proj: 'abcdef1234', state: 'running', changedAt: now - 60e3, changeKind: 'turn',
+    startAt: now - 600e3, lastAt: now - 1e3, beatAt: now - 1e3, model: 'claude-opus-5', tools: 3, errors: 0, compactions: 0,
+    turns: [turn()], subs: [[now - 30e3, 0, 2]], ...o });
+  const livePost = (dev, body, tok = W) => J('/live?dev=' + dev, { method: 'POST', headers: { 'content-type': 'application/json', authorization: 'Bearer ' + tok }, body: JSON.stringify(body) });
+  const liveGet = (tok = R) => J('/live', { headers: { authorization: 'Bearer ' + tok } });
+
+  ok((await livePost('aa11', { tier: 1, devNow: now, sessions: [sess()] }, R)).s === 401, '用读令牌推 → 401');
+  ok((await liveGet(W)).s === 401, '用写令牌读 → 401');
+  ok((await livePost('ZZ', { tier: 1, sessions: [] })).s === 400, '非法设备号 → 400');
+
+  // 档位白名单:tier 1 带来的名字 / 标题必须丢;未知字段一律丢
+  const dirty = sess({ pname: 'SecretProj', title: 'SECRET TITLE', cwd: '/Users/secret', prompt: 'SECRET PROMPT',
+    turns: [turn({ seq: 'r2s1;rm -rf', cmd: 'SECRET CMD' })] });
+  ok((await livePost('aa11', { tier: 1, devNow: now, sessions: [dirty], extra: 'SECRET' })).s === 200, 'tier 1 推送被接受');
+  let g = await liveGet();
+  let blob = JSON.stringify(g.j);
+  ok(g.s === 200 && g.j.sessions.length === 1, '读到 1 个会话');
+  ok(!/SECRET|\/Users\//.test(blob), '✦ tier 1:项目名 / 标题 / cwd / 提示词 / 命令 / 未知字段都没落库');
+  ok(g.j.sessions[0].turns[0].seq === '', '✦ 形状不对的工具序列整串丢弃');
+  ok(g.j.sessions[0].dev === 'aa11' && g.j.count.running === 1 && g.j.count.parallel === 1, '计数与设备标记');
+
+  // tier 3 收标题与项目名(去控制字符、截断)
+  await livePost('aa11', { tier: 3, devNow: now, sessions: [sess({ pname: 'Numable', title: 'ClaudeCode 工具功能扩展\u0007' + 'x'.repeat(200) })] });
+  g = await liveGet();
+  const s3 = g.j.sessions[0];
+  ok(s3.pname === 'Numable' && s3.title.startsWith('ClaudeCode 工具功能扩展x') && s3.title.length === 80, '✦ tier 3 收标题,去控制字符、截 80');
+
+  // 推导态:运行中但 5 分钟没心跳 = 断开;等你输入 40 分钟 = 搁置
+  await livePost('aa11', { tier: 1, devNow: now, sessions: [
+    sess({ sid: '11111111', beatAt: now - 300e3, lastAt: now - 300e3 }),
+    sess({ sid: '22222222', state: 'input', changedAt: now - 40 * 60e3 }),
+    sess({ sid: '33333333', state: 'perm', permSince: now - 20e3 }),
+  ] });
+  g = await liveGet();
+  const by = Object.fromEntries(g.j.sessions.map((x) => [x.sid, x]));
+  ok(by['11111111'].state === 'lost' && by['11111111'].changeKind === 'lost', '✦ 运行中 3 分钟无心跳 → 可能已断开');
+  ok(Math.abs(by['11111111'].changedAt - (now - 300e3)) < 2000, '断开的变化时刻 = 最后一次听到它');
+  ok(by['22222222'].state === 'parked', '✦ 等你输入 30 分钟以上 → 搁置');
+  ok(by['33333333'].state === 'perm' && g.j.count.parallel === 1, '「并行」不含断开 / 搁置');
+
+  // 时钟偏差:第二台设备慢 2 分钟,时间戳被校回服务端时钟;多设备合并
+  const slow = now - 120e3;
+  await livePost('bb22', { tier: 1, devNow: slow, sessions: [sess({ sid: '44444444', startAt: slow - 60e3, changedAt: slow - 10e3, beatAt: slow, lastAt: slow, turns: [turn({ s: slow - 30e3 })] })] });
+  g = await liveGet();
+  const sk = g.j.sessions.find((x) => x.sid === '44444444');
+  ok(g.j.devices.length === 2 && g.j.sessions.length === 4, '两台设备合并');
+  ok(sk && Math.abs(sk.changedAt - (now - 10e3)) < 3000 && Math.abs(sk.turns[0].s - (now - 30e3)) < 3000 && sk.state === 'running',
+    `✦ 慢 2 分钟的设备被校正(changedAt 偏 ${sk && Math.round((sk.changedAt - (now - 10e3)) / 1000)}s);校正前它会被判成断开`);
+
+  ok((await livePost('aa11', { tier: 1, devNow: now, sessions: [], pad: 'x'.repeat(70000) })).s === 413, '超 64KB → 413');
+  let limited = false;
+  for (let i = 0; i < 45 && !limited; i++) limited = (await livePost('cc33', { tier: 1, devNow: Date.now(), sessions: [] })).s === 429;
+  ok(limited, '每空间每分钟写入限流');
+}
+
 console.log(`\n${fail === 0 ? '✅' : '❌'}  pass ${pass} · fail ${fail}\n`);
 process.exit(fail ? 1 : 0);

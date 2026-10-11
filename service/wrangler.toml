@@ -24,3 +24,12 @@ migrations_dir = "migrations"
 # 每天回收 90 天无推送的空间
 [triggers]
 crons = ["17 4 * * *"]
+
+# 实时会话:每个空间一个 Durable Object(SQLite 存储,免费档可用)。见 src/live.js
+[[durable_objects.bindings]]
+name = "LIVE"
+class_name = "LiveSpace"
+
+[[migrations]]
+tag = "v1-live"
+new_sqlite_classes = ["LiveSpace"]

@@ -12,8 +12,13 @@
  *   POST /forget  Bearer<write>     { source, device } → { ok, removed }   删掉一个设备行
  *   POST /claim   { code }          → { readToken }
  *   GET  /s       Bearer<read>      → { updatedAt, merged, sources }   ?today=YYYY-MM-DD 以看的人那天为锚
+ *   POST /live    Bearer<write>     ?dev=<设备>  实时会话(整份覆盖本设备行)  → { ok }
+ *   GET  /live    Bearer<read>      → { now, updatedAt, count, devices, sessions }   见 live.js
  *   GET  /health
  */
+
+import { LiveSpace, LIVE_MAX_BODY } from './live.js';
+export { LiveSpace };
 
 const MAX_BODY = 256 * 1024;       // 单快照上限（v2 快照带逐日按模型 / 工具 / 小时明细，实测 90 天 ≈ 40KB）
 const MAX_ROWS_PER_SPACE = 20;     // source × device
@@ -1021,6 +1026,22 @@ async function handle(req, env, ctx) {
     const merged = mergeClaudeCode(sources['claude-code'] || [], anchor);
     // ?lite=1：只要合并视图（组件 / 页面用）；各设备原样快照只有 --devices 这类工具才要
     return json(url.searchParams.get('lite') === '1' ? { updatedAt, merged } : { updatedAt, merged, sources });
+  }
+
+  // ---- 实时会话(独立通道:每空间一个 Durable Object,不碰 D1)----
+  // 令牌是 HMAC 派生的,本身就证明空间是本服务签发的 → 这里不查 D1(每分钟心跳若每次都查,读额度白烧)
+  if (p === '/live' && (req.method === 'POST' || req.method === 'GET')) {
+    if (!env.LIVE) return err('live_disabled', 503);
+    const kind = req.method === 'POST' ? 'w' : 'r';
+    const spaceId = await verifyToken(env, kind, bearer(req));
+    if (!spaceId) return err('unauthorized', 401);
+    const stub = env.LIVE.get(env.LIVE.idFromName(spaceId));
+    if (req.method === 'GET') return stub.fetch('https://live/');
+    const dev = url.searchParams.get('dev') || '';
+    if (!/^[a-f0-9]{4,32}$/.test(dev)) return err('bad_device');
+    const raw = await req.text();
+    if (raw.length > LIVE_MAX_BODY) return err('payload_too_large', 413);
+    return stub.fetch('https://live/?dev=' + dev, { method: 'POST', body: raw, headers: { 'content-type': 'application/json' } });
   }
 
   return err('not_found', 404);

@@ -87,7 +87,7 @@ function sessionOf(live, ev, now) {
       turns: [], tools: 0, errors: 0, compactions: 0, open: {}, closed: [], subs: [], perm: null,
     };
   }
-  if (typeof ev.cwd === 'string' && ev.cwd) { s.cwd = ev.cwd; s.name = projectName(ev.cwd); }
+  if (typeof ev.cwd === 'string' && ev.cwd) { s.cwd = ev.cwd; const p = projectOf(ev.cwd); s.root = p.root; s.name = p.name; }
   if (typeof ev.transcript_path === 'string' && ev.transcript_path && s.transcript !== ev.transcript_path) {
     // 第一次见到这份会话记录:从当前末尾读起 —— 插件中途打开时,之前的 token 不该全算进这一轮
     s.transcript = ev.transcript_path;
@@ -101,9 +101,12 @@ function sessionOf(live, ev, now) {
   return s;
 }
 
-/** 项目名(本机显示用):worktree 归回所属项目,往上找第一个 git 仓库。只在本机,P1 上报走匿名编号。 */
+/**
+ * 项目根与名字(本机):worktree 归回所属项目,往上找第一个 git 仓库 —— 与 collect.cjs 的 projectOf 同一算法,
+ * 上报时用同一把盐算匿名编号,实时与用量两边的「项目 A」才对得上。
+ */
 const projMemo = new Map();
-function projectName(cwd) {
+function projectOf(cwd) {
   if (projMemo.has(cwd)) return projMemo.get(cwd);
   const stripped = cwd.replace(/[\\/]\.claude[\\/]worktrees[\\/][^\\/]+.*$/, '');
   let root = stripped;
@@ -113,9 +116,9 @@ function projectName(cwd) {
     if (up === d) break;
     d = up;
   }
-  const n = path.basename(root) || root;
-  projMemo.set(cwd, n);
-  return n;
+  const r = { root, name: path.basename(root) || root };
+  projMemo.set(cwd, r);
+  return r;
 }
 
 const subOf = (s, id) => s.subs.find((x) => x.id === id && x.e == null) || null;
@@ -153,8 +156,14 @@ function leavePerm(s, now) {
   s.perm = null;
 }
 
-function noteTool(t, cat) {
+const CELL_MS = 2 * 60e3;                     // 多泳道按 2 分钟一格取主要类目(§5.4)
+function noteTool(t, cat, now) {
   t.tools++;
+  if (Number.isFinite(now)) {
+    const slot = Math.min(89, Math.max(0, Math.floor((now - t.s) / CELL_MS)));
+    const c = (t.cc || (t.cc = {}))[slot] || (t.cc[slot] = {});
+    c[cat] = (c[cat] || 0) + 1;
+  }
   const last = t.seq[t.seq.length - 1];
   if (last && last[0] === cat) last[1]++; else t.seq.push([cat, 1]);
   if (t.seq.length > 40) { t.seq.splice(0, t.seq.length - 40); }
@@ -193,7 +202,7 @@ function reduce(live, ev, opts = {}) {
       if (inSub) { const sub = subOf(s, ev.agent_id); if (sub) sub.tools = (sub.tools || 0) + 1; s.tools++; if (id) s.open[id] = { cat, at: now, sub: true }; break; }
       const t = curTurn(s) || (s.state === 'ended' ? null : openTurn(s, now));
       if (!t) break;
-      s.tools++; noteTool(t, cat);
+      s.tools++; noteTool(t, cat, now);
       if (id) s.open[id] = { cat, at: now };
       if (!inSub && s.state !== 'perm' && s.state !== 'running') setState(s, 'running', 'resume', now);
       break;
@@ -219,7 +228,7 @@ function reduce(live, ev, opts = {}) {
       }
       if (t && name !== 'PermissionDenied' && !inSub && !(o && o.sub)) {
         const cat = o ? o.cat : catOf(ev.tool_name);
-        if (!o) { s.tools++; noteTool(t, cat); }      // 乱序:Pre 还没到,先在这里记上
+        if (!o) { s.tools++; noteTool(t, cat, now); }      // 乱序:Pre 还没到,先在这里记上
         const ms = Number.isFinite(ev.duration_ms) ? ev.duration_ms : (o ? now - o.at : 0);
         if (!t.longest || ms > t.longest[1]) t.longest = [cat, Math.round(ms)];
       }
@@ -423,14 +432,19 @@ async function cmdHook() {
   fs.appendFileSync(QUEUE, JSON.stringify(slim) + '\n');
   const release = lock();
   if (!release) return;
-  let live;
+  let live, changed = false;
   try {
     live = readJson(LIVE, null) || emptyLive();
+    const before = stamp(live);
     drain(live);
     prune(live);
     writeJson(LIVE, live);
+    changed = stamp(live) !== before;
   } finally { release(); }
-  if (needsDaemon(live) && !process.env.NUMABLE_LIVE_NO_DAEMON) ensureDaemon();
+  const sync = syncOn(readJson(CONFIG, null));
+  if (changed && sync) { try { fs.writeFileSync(DIRTY, String(Date.now())); } catch { /* */ } }
+  // 守护进程:本机探活要它;打开同步时,状态一变也要它来推(hook 自己不联网,免得每个事件都起一次网络请求)
+  if ((needsDaemon(live) || (changed && sync)) && !process.env.NUMABLE_LIVE_NO_DAEMON) ensureDaemon();
 }
 
 async function cmdDaemon() {
@@ -439,13 +453,17 @@ async function cmdDaemon() {
   const bye = () => { try { if (fs.readFileSync(DAEMON_LOCK, 'utf8') === String(process.pid)) fs.unlinkSync(DAEMON_LOCK); } catch { /* */ } };
   process.on('exit', bye);
   let idleSince = null;
-  let fast = true;                                         // 有会话在等授权时 2 秒巡检一次,批准后尽快翻回运行中
+  let fast = true;                                         // 有会话在等授权 / 有待推的变化时 2 秒巡检一次
+  let lastPush = 0, pushFailAt = 0;
   for (;;) {
     await new Promise((r) => setTimeout(r, fast ? Math.min(BEAT_MS, 2000) : BEAT_MS));
     if (!liveOn()) break;
+    const cfg = readJson(CONFIG, null);
+    const sync = syncOn(cfg);
+    let dirtyAt = 0; try { dirtyAt = fs.statSync(DIRTY).mtimeMs; } catch { /* 没有待推的 */ }
     const release = lock(5000);
     if (!release) continue;
-    let busy = false;
+    let busy = false, snapshot = null;
     try {
       const live = readJson(LIVE, null) || emptyLive();
       drain(live);
@@ -469,14 +487,126 @@ async function cmdDaemon() {
       }
       prune(live, now);
       writeJson(LIVE, live);
-      fast = Object.values(live.sessions).some((x) => x.state === 'perm');
+      fast = Object.values(live.sessions).some((x) => x.state === 'perm') || (sync && dirtyAt > 0);
+      snapshot = live;
     } finally { release(); }
-    if (busy) idleSince = null;
+    // 推送:有变化(合并 1.5 秒内的连续事件)立刻推;运行中 / 等授权每 60 秒心跳;失败 30 秒后再试
+    if (sync && snapshot) {
+      const now = Date.now();
+      const due = (dirtyAt && now - dirtyAt >= 1500) || (busy && now - lastPush >= HEARTBEAT_MS);
+      if (due && now - pushFailAt >= 30e3) {
+        let okPush = false;
+        try { okPush = await pushLive(snapshot, cfg); } catch (e) { log('push failed', e && e.message); }
+        if (okPush) {
+          lastPush = now;
+          try { if (fs.statSync(DIRTY).mtimeMs === dirtyAt) fs.unlinkSync(DIRTY); } catch { /* 期间又脏了,下一轮再推 */ }
+          dirtyAt = 0;
+        } else pushFailAt = now;
+      }
+    }
+    if (busy || (sync && dirtyAt)) idleSince = null;
     else if (idleSince == null) idleSince = Date.now();
     else if (Date.now() - idleSince > DAEMON_IDLE_MS) break;
   }
   bye();
 }
+
+// ---------- 上传(P1:打开「同步到手机」才有)----------
+// 设计 §1.2 分档、§3 白名单。这里**显式构造**上报体:只有写在 buildLivePayload 里的字段会离开本机。
+const CAT_CODE = { read: 'r', edit: 'e', shell: 's', agent: 'a', web: 'w', browser: 'b', device: 'd', mcp: 'm', ask: 'q', other: 'o' };
+const ENDPOINT = process.env.NUMABLE_USAGE_ENDPOINT || 'https://usage.numable.app';
+const DIRTY = path.join(STATE_DIR, 'live-dirty');
+const LIVE_PUSH_MAX = 60 * 1024;              // 服务端上限 64KB,留余量
+const HEARTBEAT_MS = 60e3;                    // 运行中 / 等授权时的心跳推送间隔
+const ACTIVE_TURNS = 60;
+const ENDED_WINDOW_MS = 6 * 3600e3;           // 已结束的会话只传最大时间窗(6 小时)里的轮
+
+const hash = (salt, v, n) => require('node:crypto').createHash('sha256').update(String(salt) + '|' + v).digest('hex').slice(0, n);
+
+/** 标题脱敏:令牌 / 邮箱 / URL / 长十六进制 / 绝对路径在本机换成 … 再上报(§1.2) */
+function redactTitle(t) {
+  return String(t)
+    .replace(/https?:\/\/\S+/gi, '…')
+    .replace(/[\w.+-]+@[\w-]+\.[\w.-]+/g, '…')
+    .replace(/(?:^|\s)(?:~|\/)[\w.~-]*(?:\/[\w.-]+)+/g, ' …')
+    .replace(/\b(?:sk|pk|rk|ghp|gho|xox[bap]|eyJ)[\w-]{8,}\b/g, '…')
+    .replace(/\b[a-f0-9]{24,}\b/gi, '…')
+    .replace(/\s+/g, ' ').trim().slice(0, 80);
+}
+
+function encodeTurn(t) {
+  const seq = t.seq.map(([c, n]) => (CAT_CODE[c] || 'o') + Math.min(n, 9999)).join('');
+  let cells = '';
+  if (t.cc) {
+    const max = Math.max(-1, ...Object.keys(t.cc).map(Number));
+    for (let i = 0; i <= max; i++) {
+      const c = t.cc[i];
+      if (!c) { cells += '.'; continue; }
+      const top = Object.entries(c).sort((a, b) => b[1] - a[1])[0][0];
+      cells += CAT_CODE[top] || 'o';
+    }
+  }
+  return {
+    n: t.n, s: t.s, e: t.e, perm: t.permMs, tools: t.tools, seq, cells,
+    long: t.longest ? [CAT_CODE[t.longest[0]] || 'o', t.longest[1]] : null,
+    out: t.tok.out, in: t.tok.in, cw: t.tok.cw, end: t.end,
+  };
+}
+
+/**
+ * 上报体。opts:{ salt, titles, names, now, alive }。
+ * L1 恒有:匿名会话号 / 匿名项目号 / 状态 / 时刻 / 逐轮结构与数字;names → + 项目文件夹名;titles → + 脱敏后的标题。
+ */
+function buildLivePayload(live, opts) {
+  const now = opts.now || Date.now();
+  const alive = opts.alive || pidAlive;
+  const salt = opts.salt || 'nosalt';
+  const sessions = Object.values(live.sessions).map((s) => {
+    const st = derive(s, now, alive);
+    const ended = s.state === 'ended' || s.state === 'lost' || st === 'lost';
+    const turns = (ended ? s.turns.filter((t) => (t.e || now) > now - ENDED_WINDOW_MS) : s.turns).slice(-ACTIVE_TURNS);
+    const r = {
+      sid: hash(salt, 'sid:' + s.sid, 12),
+      proj: s.root ? hash(salt, s.root, 10) : null,
+      state: st === 'parked' ? 'input' : st,          // 搁置由服务端按时刻推
+      changedAt: s.changedAt, changeKind: st === 'lost' && s.state !== 'lost' ? 'lost' : s.changeKind,
+      startAt: s.startAt, lastAt: s.lastEventAt, beatAt: s.beatAt || s.lastEventAt, endAt: s.endAt || null,
+      permSince: s.perm ? s.perm.since : null,
+      model: s.model, tools: s.tools, errors: s.errors, compactions: s.compactions,
+      turns: turns.map(encodeTurn),
+      subs: s.subs.slice(-30).map((x) => [x.s, x.e || 0, x.tools || 0]),
+    };
+    if (opts.names && s.name) r.pname = String(s.name).slice(0, 40);
+    if (opts.titles && s.title) { const t = redactTitle(s.title); if (t) r.title = t; }
+    return r;
+  });
+  const body = { tier: opts.titles ? 3 : opts.names ? 2 : 1, devNow: now, sessions };
+  // 超限:先丢已结束会话的逐轮,再丢最旧的已结束会话
+  const size = () => Buffer.byteLength(JSON.stringify(body));
+  const endedFirst = () => body.sessions.filter((x) => x.state === 'ended' || x.state === 'lost').sort((a, b) => a.changedAt - b.changedAt);
+  for (const x of endedFirst()) { if (size() <= LIVE_PUSH_MAX) break; x.turns = []; }
+  while (size() > LIVE_PUSH_MAX && endedFirst().length) body.sessions.splice(body.sessions.indexOf(endedFirst()[0]), 1);
+  return body;
+}
+
+const syncOn = (cfg) => !!(cfg && cfg.live === true && cfg.liveSync === true && cfg.writeToken);
+
+async function pushLive(live, cfg) {
+  const h = readJson(HISTORY, null);
+  const { deviceId } = require('./collect.cjs');
+  const device = deviceId(cfg);
+  const body = buildLivePayload(live, { salt: h && h.salt, titles: cfg.titles === true, names: cfg.projectNames === true });
+  const res = await fetch(`${ENDPOINT}/live?dev=${device}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${cfg.writeToken}` },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(8000),
+  });
+  return res.ok;
+}
+
+/** 有没有「值得马上推」的变化:任何会话的状态或变化时刻变了。 */
+const stamp = (live) => Object.values(live.sessions).map((s) => `${s.sid}:${s.state}:${s.changedAt}`).sort().join('|');
 
 // ---------- 展示 ----------
 const fmtN = (n) => (n >= 1e9 ? (n / 1e9).toFixed(1) + 'B' : n >= 1e6 ? (n / 1e6).toFixed(1) + 'M' : n >= 1e3 ? (n / 1e3).toFixed(1) + 'k' : String(n));
@@ -534,8 +664,23 @@ function sessionRows(live, now = Date.now(), alive = pidAlive) {
     });
 }
 
-function cmdLive(v) {
+function cmdLive(v, w) {
   const cur = readJson(CONFIG, {}) || {};
+  if (v === 'sync') {
+    if (w === 'on' || w === 'off') {
+      cur.liveSync = w === 'on';
+      if (cur.liveSync) cur.live = true;
+      writeJson(CONFIG, cur);
+      console.log(w === 'on'
+        ? (cur.writeToken
+          ? '已打开同步:各会话的状态与每一轮的结构会上传,在 Numable 里就能看到(工具「Claude Code 用量」→ 实时)。\n上传的只有:匿名会话号、匿名项目号、状态、时刻、工具类目与次数、token;没有提示词、命令、文件名。\n要显示项目名:--projects on;要显示会话标题:--titles on。'
+          : '已打开同步,但这台电脑还没接上 Numable —— 先运行一次 Claude Code 会话让它建好空间,或用 --join 加入已有空间。')
+        : '已关闭同步。服务端的实时数据 24 小时内自动清掉。');
+      return;
+    }
+    console.log(syncOn(cur) ? '同步到手机:已打开。关掉:--live sync off' : '同步到手机:未打开。打开:--live sync on');
+    return;
+  }
   if (v === 'on' || v === 'off') {
     cur.live = v === 'on';
     writeJson(CONFIG, cur);
@@ -544,7 +689,22 @@ function cmdLive(v) {
       : '已关闭实时会话。本机已记录的 live.json 保留,可手动删除。');
     return;
   }
-  console.log(cur.live === true ? '实时会话:已打开(只在本机)。关掉:--live off' : '实时会话:未打开。打开:--live on');
+  console.log(cur.live === true
+    ? `实时会话:已打开。同步到手机:${syncOn(cur) ? '已打开' : '未打开(--live sync on)'}。关掉:--live off`
+    : '实时会话:未打开。打开:--live on');
+}
+
+function cmdTitles(v) {
+  const cur = readJson(CONFIG, {}) || {};
+  if (v === 'on' || v === 'off') {
+    cur.titles = v === 'on';
+    writeJson(CONFIG, cur);
+    console.log(v === 'on'
+      ? '已打开:同步时会附上会话标题(最多 80 字;其中的网址、邮箱、路径、密钥样的长串会先在本机换成 …)。随时 --titles off。'
+      : '已关闭:不再上传会话标题,服务端旧值在下一次同步时被覆盖掉。');
+    return;
+  }
+  console.log(cur.titles === true ? '会话标题:上传(--titles off 关掉)' : '会话标题:不上传(--titles on 打开)');
 }
 
 function cmdSessions() {
@@ -565,7 +725,8 @@ async function main() {
     process.stdout.write(liveOn() ? statusLine(live) : '');
     return;
   }
-  if (arg === '--live') return cmdLive(process.argv[3]);
+  if (arg === '--live') return cmdLive(process.argv[3], process.argv[4]);
+  if (arg === '--titles') return cmdTitles(process.argv[3]);
   if (arg === '--sessions') return cmdSessions();
 }
 
@@ -573,4 +734,4 @@ if (require.main === module) {
   main().catch((e) => { log('fatal (swallowed)', e && e.message); });
 }
 
-module.exports = { approvedAt, etimeMs, catOf, reduce, derive, prune, counts, statusLine, sessionRows, emptyLive, readTokens, interruptedSince, PARK_MS };
+module.exports = { buildLivePayload, redactTitle, encodeTurn, approvedAt, etimeMs, catOf, reduce, derive, prune, counts, statusLine, sessionRows, emptyLive, readTokens, interruptedSince, PARK_MS };
