@@ -1036,7 +1036,7 @@ async function handle(req, env, ctx) {
     const spaceId = await verifyToken(env, kind, bearer(req));
     if (!spaceId) return err('unauthorized', 401);
     const stub = env.LIVE.get(env.LIVE.idFromName(spaceId));
-    if (req.method === 'GET') return stub.fetch('https://live/');
+    if (req.method === 'GET') return stub.fetch('https://live/' + url.search);
     const dev = url.searchParams.get('dev') || '';
     if (!/^[a-f0-9]{4,32}$/.test(dev)) return err('bad_device');
     const raw = await req.text();
