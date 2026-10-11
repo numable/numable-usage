@@ -118,7 +118,11 @@ function projectName(cwd) {
   return n;
 }
 
+const subOf = (s, id) => s.subs.find((x) => x.id === id && x.e == null) || null;
 const curTurn = (s) => { const t = s.turns[s.turns.length - 1]; return t && t.e == null ? t : null; };
+
+/** 主会话没有进行中的轮次时该是什么状态:还有后台子代理在跑 = 运行中,否则等你输入。 */
+const restState = (s) => (curTurn(s) || s.subs.some((x) => x.e == null) ? 'running' : 'input');
 
 function setState(s, state, kind, now) {
   if (s.state === state && kind !== 'turn') return;
@@ -162,6 +166,7 @@ function noteTool(t, cat) {
  */
 function reduce(live, ev, opts = {}) {
   if (!ev || typeof ev.session_id !== 'string' || !ev.session_id) return live;
+  if (ev.hook_event_name === 'SessionEnd' && !live.sessions[ev.session_id]) return live;   // 没见过的会话只来一个「结束」:不建空记录
   const now = Number.isFinite(ev._t) ? ev._t : Date.now();
   const s = sessionOf(live, ev, now);
   const name = ev.hook_event_name;
@@ -183,9 +188,11 @@ function reduce(live, ev, opts = {}) {
     case 'PreToolUse': {
       const id = ev.tool_use_id;
       if (id && s.closed.includes(id)) break;          // Post 先到了,这条只是迟到的 Pre
+      const cat = catOf(ev.tool_name);
+      // 子代理的工具调用:后台子代理在主轮结束后还会继续调工具 —— 只记到子代理名下,绝不替主会话开新的一轮
+      if (inSub) { const sub = subOf(s, ev.agent_id); if (sub) sub.tools = (sub.tools || 0) + 1; s.tools++; if (id) s.open[id] = { cat, at: now, sub: true }; break; }
       const t = curTurn(s) || (s.state === 'ended' ? null : openTurn(s, now));
       if (!t) break;
-      const cat = catOf(ev.tool_name);
       s.tools++; noteTool(t, cat);
       if (id) s.open[id] = { cat, at: now };
       if (!inSub && s.state !== 'perm' && s.state !== 'running') setState(s, 'running', 'resume', now);
@@ -195,7 +202,7 @@ function reduce(live, ev, opts = {}) {
     case 'Notification': {
       if (name === 'Notification' && ev.notification_type !== 'permission_prompt') break;
       if (s.state === 'perm' || s.state === 'ended') break;
-      if (!curTurn(s)) openTurn(s, now);
+      if (!curTurn(s) && !inSub) openTurn(s, now);    // 子代理弹授权:也是在等你,但不替主会话开轮
       s.perm = { since: now };
       setState(s, 'perm', 'perm', now);
       break;
@@ -210,21 +217,21 @@ function reduce(live, ev, opts = {}) {
         delete s.open[id];
         s.closed.push(id); if (s.closed.length > 64) s.closed.shift();
       }
-      if (t && name !== 'PermissionDenied') {
+      if (t && name !== 'PermissionDenied' && !inSub && !(o && o.sub)) {
         const cat = o ? o.cat : catOf(ev.tool_name);
         if (!o) { s.tools++; noteTool(t, cat); }      // 乱序:Pre 还没到,先在这里记上
         const ms = Number.isFinite(ev.duration_ms) ? ev.duration_ms : (o ? now - o.at : 0);
         if (!t.longest || ms > t.longest[1]) t.longest = [cat, Math.round(ms)];
       }
-      if (name === 'PostToolUseFailure') { s.errors++; if (ev.is_interrupt) { closeTurn(s, 'interrupt', now); setState(s, 'input', 'interrupt', now); break; } }
-      if (s.state === 'perm' && !inSub) { leavePerm(s, now); setState(s, 'running', 'resume', now); }
+      if (name === 'PostToolUseFailure') { s.errors++; if (ev.is_interrupt && !inSub) { closeTurn(s, 'interrupt', now); setState(s, 'input', 'interrupt', now); break; } }
+      if (s.state === 'perm') { leavePerm(s, now); setState(s, restState(s), 'resume', now); }
       break;
     }
     case 'Stop':
     case 'StopFailure': {
       const t = closeTurn(s, name === 'Stop' ? 'ok' : 'error', now);
       if (t && opts.tokens) addTokens(s, t, opts.tokens);
-      setState(s, 'input', name === 'Stop' ? 'done' : 'error', now);
+      setState(s, restState(s), name === 'Stop' ? 'done' : 'error', now);
       break;
     }
     case 'SubagentStart': {
@@ -234,6 +241,7 @@ function reduce(live, ev, opts = {}) {
     case 'SubagentStop': {
       const sub = s.subs.find((x) => x.id === ev.agent_id && x.e == null);
       if (sub) sub.e = now;
+      if (s.state === 'running' && !curTurn(s) && restState(s) === 'input') setState(s, 'input', 'done', now);
       break;
     }
     case 'PreCompact': s.compactions++; break;
@@ -308,6 +316,36 @@ function interruptedSince(transcript, since) {
   finally { if (fd != null) try { fs.closeSync(fd); } catch { /* */ } }
   return false;
 }
+
+/**
+ * 批准那一刻 Claude Code 不发任何 hook 事件、会话记录里也不写 —— 长命令批准后要等跑完 PostToolUse 才退出「等你授权」,
+ * 期间一直错报。e2e 实测:Bash 工具的命令是 Claude Code 的**直接子进程** `/bin/zsh -c source ~/.claude/shell-snapshots/…`。
+ * 等授权时若出现一个晚于弹窗启动的这种子进程 = 你已批准、命令正在跑;返回它的启动时刻,否则 null。
+ * 只覆盖 Bash(其它工具批准后一般立刻跑完,PostToolUse 很快就到);Windows 没有 ps,退回只认 PostToolUse。
+ */
+function approvedAt(pid, since, psOut) {
+  if (!pid) return null;
+  let out = psOut;
+  if (out == null) {
+    if (process.platform === 'win32') return null;
+    try { out = require('node:child_process').execFileSync('ps', ['-A', '-o', 'pid=,ppid=,etime=,command='], { encoding: 'utf8', timeout: 3000 }); } catch { return null; }
+  }
+  const now = Date.now();
+  let best = null;
+  for (const line of out.split('\n')) {
+    const m = line.trim().match(/^(\d+)\s+(\d+)\s+(\S+)\s+(.*)$/);
+    if (!m || Number(m[2]) !== pid || m[4].indexOf('shell-snapshots') < 0) continue;
+    const startedAt = now - etimeMs(m[3]);
+    if (startedAt > since && (best == null || startedAt < best)) best = startedAt;
+  }
+  return best;
+}
+const etimeMs = (e) => {                                     // [[dd-]hh:]mm:ss
+  const [d, rest] = e.includes('-') ? e.split('-') : ['0', e];
+  const p = rest.split(':').map(Number);
+  while (p.length < 3) p.unshift(0);
+  return ((Number(d) * 24 + p[0]) * 3600 + p[1] * 60 + p[2]) * 1000;
+};
 
 /** 显示用的状态(§1.4):在存储状态上叠加「搁置」「可能已断开」两个推导态。 */
 function derive(s, now = Date.now(), alive = pidAlive) {
@@ -401,8 +439,9 @@ async function cmdDaemon() {
   const bye = () => { try { if (fs.readFileSync(DAEMON_LOCK, 'utf8') === String(process.pid)) fs.unlinkSync(DAEMON_LOCK); } catch { /* */ } };
   process.on('exit', bye);
   let idleSince = null;
+  let fast = true;                                         // 有会话在等授权时 2 秒巡检一次,批准后尽快翻回运行中
   for (;;) {
-    await new Promise((r) => setTimeout(r, BEAT_MS));
+    await new Promise((r) => setTimeout(r, fast ? Math.min(BEAT_MS, 2000) : BEAT_MS));
     if (!liveOn()) break;
     const release = lock(5000);
     if (!release) continue;
@@ -417,6 +456,10 @@ async function cmdDaemon() {
           closeTurn(s, 'lost', now); s.endAt = now; setState(s, 'lost', 'lost', now);
           continue;
         }
+        if (s.state === 'perm' && s.perm) {
+          const at = approvedAt(s.pid, s.perm.since + 500);   // 0.5s 余量:etime 只到秒
+          if (at != null) { leavePerm(s, Math.max(at, s.perm.since)); setState(s, 'running', 'approved', now); }
+        }
         const t = curTurn(s);
         if (s.state === 'running' && t && s.transcript && interruptedSince(s.transcript, t.s)) {
           closeTurn(s, 'interrupt', now); setState(s, 'input', 'interrupt', now);
@@ -426,6 +469,7 @@ async function cmdDaemon() {
       }
       prune(live, now);
       writeJson(LIVE, live);
+      fast = Object.values(live.sessions).some((x) => x.state === 'perm');
     } finally { release(); }
     if (busy) idleSince = null;
     else if (idleSince == null) idleSince = Date.now();
@@ -481,7 +525,7 @@ function sessionRows(live, now = Date.now(), alive = pidAlive) {
     .sort((a, b) => order[a.st] - order[b.st] || b.s.changedAt - a.s.changedAt)
     .map(({ s, st }) => {
       const t = s.turns[s.turns.length - 1];
-      const run = s.turns.reduce((a, x) => a + ((x.e || now) - x.s - x.permMs), 0);
+      const run = s.turns.reduce((a, x) => a + ((x.e || now) - x.s - x.permMs), 0) - (s.perm ? now - s.perm.since : 0);   // 正在等的授权不算实跑
       const tok = s.turns.reduce((a, x) => a + x.tok.out + x.tok.in + x.tok.cw, 0);
       let doing = s.title || '';
       if (st === 'running' && t && t.seq.length) doing = `正在${CAT_ZH[t.seq[t.seq.length - 1][0]] || '干活'}` + (s.title ? ` · ${s.title}` : '');
@@ -529,4 +573,4 @@ if (require.main === module) {
   main().catch((e) => { log('fatal (swallowed)', e && e.message); });
 }
 
-module.exports = { catOf, reduce, derive, prune, counts, statusLine, sessionRows, emptyLive, readTokens, interruptedSince, PARK_MS };
+module.exports = { approvedAt, etimeMs, catOf, reduce, derive, prune, counts, statusLine, sessionRows, emptyLive, readTokens, interruptedSince, PARK_MS };

@@ -185,3 +185,35 @@ test('守护进程:Claude Code 进程没了就标「可能已断开」,不替它
   assert.equal(out.sessions.s.turns[0].end, 'lost');
   assert.equal(fs.existsSync(path.join(dir, 'live-daemon.pid')), false);   // 退出时清掉自己的锁
 });
+
+test('批准检测:等授权后 Claude Code 下面新起的 shell-snapshots 子进程 = 已批准;更早的、别的进程不算', () => {
+  assert.equal(L.etimeMs('01:11'), 71000);
+  assert.equal(L.etimeMs('1-02:00:05'), (26 * 3600 + 5) * 1000);
+  const now = Date.now();
+  const ps = [
+    ' 9064  2016       01:21 caffeinate -i -t 300',
+    ' 9315  2016       00:10 /bin/zsh -c source /Users/x/.claude/shell-snapshots/snapshot-zsh-1.sh 2>/dev/null || true && eval find',
+    ' 9400  2016       05:00 /bin/zsh -c source /Users/x/.claude/shell-snapshots/snapshot-zsh-1.sh && eval old',   // 弹窗之前就在跑(后台任务)
+    ' 9500  3333       00:05 /bin/zsh -c source /Users/x/.claude/shell-snapshots/snapshot-zsh-1.sh && eval other', // 别的 Claude Code
+  ].join('\n');
+  const at = L.approvedAt(2016, now - 60e3, ps);
+  assert.ok(at != null && Math.abs(at - (now - 10e3)) < 1500);
+  assert.equal(L.approvedAt(2016, now - 5e3, ps), null);      // 10 秒前起的那个早于弹窗 → 不算
+});
+
+test('后台子代理:主轮结束后子代理的工具调用不开新轮;它弹授权 = 等你授权;批了回到运行中(后台);子代理结束回等你输入', () => {
+  const live = L.emptyLive();
+  let s = feed(live, ev('UserPromptSubmit'), ev('PreToolUse', { tool_name: 'Agent', tool_use_id: 'ag' }),
+    ev('SubagentStart', { agent_id: 'g', agent_type: 'Explore' }), ev('PostToolUse', { tool_name: 'Agent', tool_use_id: 'ag' }), ev('Stop'));
+  assert.equal(s.turns.length, 1);
+  assert.equal(s.state, 'running');                          // 主轮完了,后台子代理还在跑
+  s = feed(live, ev('PreToolUse', { tool_name: 'Bash', tool_use_id: 'b1', agent_id: 'g' }), ev('PermissionRequest', { tool_name: 'Bash', agent_id: 'g' }));
+  assert.equal(s.turns.length, 1);
+  assert.equal(s.state, 'perm');
+  s = feed(live, ev('PostToolUse', { tool_name: 'Bash', tool_use_id: 'b1', agent_id: 'g' }));
+  assert.equal(s.state, 'running');
+  assert.deepEqual(s.turns[0].seq, [['agent', 1]]);           // 子代理的工具没混进主轮
+  s = feed(live, ev('SubagentStop', { agent_id: 'g' }));
+  assert.equal(s.state, 'input');
+  assert.equal(s.subs[0].tools, 1);
+});
