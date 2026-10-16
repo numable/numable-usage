@@ -56,16 +56,40 @@ const ALL_MODELS = process.env.NUMABLE_USAGE_MODELS === 'all';
 
 const log = (...a) => { if (DEBUG) console.error('[numable-usage]', ...a); };
 
+// ---------- 运行日志 ----------
+// 每次采集的起止、耗时、读了多少、锁被抢的现场,写在本机 runs.log(只有数字与事件名,不含路径 / 内容,不上传)。
+// 「电脑突然几个 collect.cjs 满核」这类问题事后没有现场,靠它还原。超过 RUNLOG_MAX 截掉前半,永远很小。
+const RUNLOG = 'runs.log';
+const RUNLOG_MAX = 128 * 1024;
+function trace(event, fields = {}, dir = STATE_DIR) {
+  try {
+    const kv = Object.entries(fields).map(([k, v]) => `${k}=${v}`).join(' ');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.appendFileSync(path.join(dir, RUNLOG), `${new Date().toISOString()} pid=${process.pid} ${event}${kv ? ' ' + kv : ''}\n`);
+  } catch { /* 日志写不了不影响采集 */ }
+}
+/** 持锁时调用:过大就只留后一半(按整行) */
+function trimTrace(dir = STATE_DIR) {
+  try {
+    const f = path.join(dir, RUNLOG);
+    if (fs.statSync(f).size <= RUNLOG_MAX) return;
+    const b = fs.readFileSync(f);
+    const cut = b.indexOf(0x0a, b.length - RUNLOG_MAX / 2);
+    if (cut >= 0) writeFileAtomic(f, b.subarray(cut + 1));
+  } catch { /* 没有就算了 */ }
+}
+
 // ---------- 小工具 ----------
 const readJson = (p, fb) => { try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return fb; } };
-const writeJson = (p, v) => {
+function writeFileAtomic(p, data) {
   fs.mkdirSync(path.dirname(p), { recursive: true });
   // 临时文件名带 pid：多个会话同时触发 hook 时，共用一个 .tmp 会交错写出坏 JSON，
   // 坏了 loadHistory 只能退回空历史 —— 已被 Claude Code 清理掉的会话记录就永久丢了。
   const tmp = `${p}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(v));
+  fs.writeFileSync(tmp, data);
   fs.renameSync(tmp, p);                     // 原子替换，防写一半被打断
-};
+}
+const writeJson = (p, v) => writeFileAtomic(p, JSON.stringify(v));
 const localDay = (d) =>
   `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 
@@ -104,16 +128,19 @@ function tryLock(lockPath) {
       if (e.code !== 'EEXIST') throw e;
     }
     // 持锁进程已经不在了（被杀 / 崩溃）或心跳停了（挂死 / pid 被复用）→ 清掉再试一次
-    let stale;
+    let stale, holder = '', age = -1, alive = '';
     try {
       const raw = fs.readFileSync(lockPath, 'utf8');
       const pid = parseInt(raw, 10);
-      const age = Date.now() - fs.statSync(lockPath).mtimeMs;
+      age = Date.now() - fs.statSync(lockPath).mtimeMs;
       // ⚠️ 对方是先 open('wx') 建出空文件、再写进程号 —— 读到空内容 = 对方正在写，不是死了。
       // 按「pid 不在」判过期会在这个缝里抢走一把活锁（两个进程同时持锁，首次接入建出两个空间）。
-      stale = Number.isInteger(pid) && pid > 0 ? !pidAlive(pid) || age > LOCK_STALE_MS : age > 10000;
+      holder = raw; alive = Number.isInteger(pid) && pid > 0 ? pidAlive(pid) : '';
+      stale = Number.isInteger(pid) && pid > 0 ? !alive || age > LOCK_STALE_MS : age > 10000;
     } catch { stale = true; }                // 读不到 = 对方刚释放
     if (!stale) return false;
+    // 抢一把还活着的锁 = 有人卡住了十分钟以上,是事后排查最要紧的现场
+    if (holder) trace('lock-steal', { lock: path.basename(lockPath), holder, alive, ageS: Math.round(age / 1000) }, path.dirname(lockPath));
     try { fs.unlinkSync(lockPath); } catch { /* 别人先清了 */ }
   }
   return false;
@@ -576,6 +603,7 @@ function lastLineEnd(f, from, size) {
 // 超过这个时长没动过的文件不会再续写同一个响应，不必留去重键（history 保持小）
 const RECENT_TTL_MS = 2 * 864e5;
 
+let scanBytes = 0;                                   // 本轮实际读了多少字节(运行日志用)
 async function scan(history, root = PROJECTS, onFile) {
   if (!fs.existsSync(root)) { log('no projects dir'); return 0; }
   const files = listJsonl(root);
@@ -602,6 +630,7 @@ async function scan(history, root = PROJECTS, onFile) {
     try { off = lastLineEnd(f, from, fst.size); } catch { continue; }
 
     if (off > from) {
+      scanBytes += off - from;
       await eachLine(f, from, off, (line) => {
         try { absorb(history.days, JSON.parse(line), st, history); } catch { /* 坏行，丢弃 */ }
       });
@@ -1052,6 +1081,7 @@ async function main() {
     try { if (Date.now() - fs.statSync(mark).mtimeMs < TICK_MS) return; } catch { /* 没有标记 = 从没起过 */ }
   }
   try { fs.mkdirSync(STATE_DIR, { recursive: true }); fs.writeFileSync(mark, ''); } catch { /* 标记写不了只是少节流 */ }
+  trace('spawn', { by: arg === '--tick' ? 'tick' : 'hook' });
 
   // hook 入口：把采集甩给一个脱离会话的后台进程，自己立刻退出。
   // 首次（或 history 升级后）全量重扫要十几秒，挂在 SessionStart 上会让会话卡住等它。
@@ -1072,21 +1102,32 @@ async function runCollect() {
   try { os.setPriority(19); } catch { /* 没权限就照常跑 */ }
   // 读-改-写 config / history 全程持锁；拿不到（别的会话正在采集）就放弃这一轮 ——
   // 它会顺带把本会话已写下的行也扫进去，漏掉的尾巴下一次 hook 触发时补上。
+  const t0 = Date.now(), c0 = process.cpuUsage();
   const release = await acquireLock();
-  if (!release) { log('another collector is running, skip'); return; }
+  if (!release) { log('another collector is running, skip'); trace('skip-busy', { waitS: Math.round((Date.now() - t0) / 1000) }); return; }
+  trimTrace();
+  trace('start', { load: os.loadavg()[0].toFixed(1), waitS: Math.round((Date.now() - t0) / 1000) });
+  let res = 'error';
   try {
-    await collectAndPush();
+    res = (await collectAndPush()) || 'ok';
+  } catch (e) {
+    trace('error', { msg: JSON.stringify(String(e && e.message).slice(0, 120)) });
+    throw e;
   } finally {
+    const cu = process.cpuUsage(c0);
+    trace('end', { res, s: ((Date.now() - t0) / 1000).toFixed(1), cpuS: ((cu.user + cu.system) / 1e6).toFixed(1),
+      readMB: (scanBytes / 1e6).toFixed(1), ...collectStat });
     release();
   }
 }
 
+const collectStat = {};                              // 本轮的扫描规模(运行日志用)
 async function collectAndPush({ force = false } = {}) {
   let cfg = readJson(CONFIG, null);
 
   if (!cfg || !cfg.spaceId || !cfg.writeToken) {
     const r = await post('/space', {});
-    if (!r.ok || !r.json || !r.json.spaceId) { log('create space failed', r.status, r.text); return; }
+    if (!r.ok || !r.json || !r.json.spaceId) { log('create space failed', r.status, r.text); return 'space-failed-' + r.status; }
     cfg = {
       endpoint: ENDPOINT,
       spaceId: r.json.spaceId,
@@ -1104,7 +1145,7 @@ async function collectAndPush({ force = false } = {}) {
   const history = loadHistory();
   REVIEW_TITLES = cfg.titles === true;
   // 从空历史扫起时,回顾已由 absorb → reviewRow 逐行算好 —— 不必再回补一遍(那会把近 14 天的文件从头再读一次)
-  if (!Object.keys(history.files).length) { history.reviewV = 1; history.reviewT = REVIEW_TITLES; }
+  if (!Object.keys(history.files).length) { history.reviewV = 1; history.reviewT = REVIEW_TITLES; collectStat.full = 1; }
   // 全量扫描每隔一段落一次盘:中途被杀(合盖 / 关机)下次接着扫,不从头来
   let lastSave = Date.now();
   let touched = await scan(history, PROJECTS, () => {
@@ -1113,10 +1154,12 @@ async function collectAndPush({ force = false } = {}) {
     writeJson(HISTORY, history);
     lastSave = Date.now();
     log('checkpoint');
+    trace('checkpoint', { readMB: (scanBytes / 1e6).toFixed(1) });
   });
   // 每日回顾:第一次升级到 0.9.0、或标题开关变了 → 回补近 14 天(只重算回顾,别的不动)
   if (history.reviewV !== 1 || history.reviewT !== REVIEW_TITLES) {
     await backfillReview(history);
+    collectStat.backfill = 1;
     touched++;
     log('review backfilled');
   }
@@ -1124,8 +1167,9 @@ async function collectAndPush({ force = false } = {}) {
   prune(history);
   writeJson(HISTORY, history);
   log('scanned files:', touched, 'days:', Object.keys(history.days).length);
+  collectStat.files = touched;
 
-  if (!touched && !force && !process.env.NUMABLE_USAGE_FORCE) { log('nothing changed, skip push'); return; }
+  if (!touched && !force && !process.env.NUMABLE_USAGE_FORCE) { log('nothing changed, skip push'); return 'unchanged'; }
 
   // 设备标识第一次算出后钉进 config，之后不再重算。
   // ⚠️ macOS 没设 HostName 时 os.hostname() 随网络变（DHCP / Bonjour 名），
@@ -1138,7 +1182,7 @@ async function collectAndPush({ force = false } = {}) {
 
   const payload = buildPayload(history, device, { projectNames: cfg.projectNames === true, titles: cfg.titles === true });
   const r = await post('/ingest', payload, cfg.writeToken);
-  if (!r.ok) { log('ingest failed', r.status, r.text); return; }
+  if (!r.ok) { log('ingest failed', r.status, r.text); return 'push-failed-' + r.status; }
   log('pushed', payload.snapshot.days.length, 'days');
   applyLiveRequest(r.json && r.json.liveReq);
 }
@@ -1183,4 +1227,4 @@ if (require.main === module) {
 }
 
 // 供测试用（hook 直接执行本文件，走上面那条）
-module.exports = { applyLiveRequest, deviceId, reviewRow, reviewOfDay, backfillReview, redactTitle, absorb, isHumanPrompt, scan, loadHistory, buildPayload, foldWindows, acquireLock, tryLock, emptyDay, ghostOf, activeMinutes, flushAct, touchSession, countLines };
+module.exports = { trace, trimTrace, applyLiveRequest, deviceId, reviewRow, reviewOfDay, backfillReview, redactTitle, absorb, isHumanPrompt, scan, loadHistory, buildPayload, foldWindows, acquireLock, tryLock, emptyDay, ghostOf, activeMinutes, flushAct, touchSession, countLines };

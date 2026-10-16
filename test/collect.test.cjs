@@ -163,6 +163,23 @@ test('锁:持锁进程活着就靠心跳续命,拿得再久也不许抢;释放�
   assert.equal(fs.readFileSync(lock, 'utf8'), '1');
 });
 
+test('运行日志:抢一把活锁留下现场;超长时只留后一半且按整行截', () => {
+  const dir = tmp();
+  const lock = path.join(dir, 'lock');
+  fs.writeFileSync(lock, String(process.pid));          // 活着的持锁进程
+  const old = new Date(Date.now() - 3600e3);
+  fs.utimesSync(lock, old, old);                         // 心跳停了一个小时
+  assert.equal(C.tryLock(lock), true);
+  assert.match(fs.readFileSync(path.join(dir, 'runs.log'), 'utf8'), new RegExp(`lock-steal lock=lock holder=${process.pid} alive=true ageS=36\\d\\d`));
+
+  const f = path.join(dir, 'runs.log');
+  fs.writeFileSync(f, Array.from({ length: 4000 }, (_, i) => `line ${i} ${'x'.repeat(40)}`).join('\n') + '\n');
+  C.trimTrace(dir);
+  const kept = fs.readFileSync(f, 'utf8');
+  assert.ok(kept.length <= 64 * 1024 && kept.length > 60 * 1024);
+  assert.ok(kept.startsWith('line ') && kept.endsWith('line 3999 ' + 'x'.repeat(40) + '\n'));
+});
+
 test('逐行读:跨块的超长行、多字节字符落在块边界、CRLF 都按原样计', async () => {
   const root = tmp();
   const f = path.join(root, 'a.jsonl');
@@ -212,7 +229,15 @@ test('多个会话同时首次触发：只建一个空间、history 不写坏、
   const h = JSON.parse(fs.readFileSync(path.join(state, 'history.json'), 'utf8'));
   assert.equal(h.days[DAY].msgs, 20 * 200 * 2);
   assert.equal(h.days[DAY].out, 20 * 200 * 10);
-  assert.deepEqual(fs.readdirSync(state).sort(), ['config.json', 'history.json']); // 无残留 tmp / lock
+  assert.deepEqual(fs.readdirSync(state).sort(), ['config.json', 'history.json', 'runs.log']); // 无残留 tmp / lock
+  // 运行日志:每个拿到锁的都有始有终,没有一次抢锁
+  const runlog = fs.readFileSync(path.join(state, 'runs.log'), 'utf8');
+  const count = (re) => (runlog.match(re) || []).length;
+  assert.ok(count(/ start /g) >= 1);
+  assert.equal(count(/ start /g), count(/ end res=/g));
+  assert.equal(count(/ start /g) + count(/ skip-busy /g), 6);
+  assert.equal(count(/lock-steal/g), 0);
+  assert.ok(!/\/Users|\/home|\.jsonl/.test(runlog));                 // 不含路径
 });
 
 test('hook 入口立刻返回，采集在后台跑完', async (t) => {
