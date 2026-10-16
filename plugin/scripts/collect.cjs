@@ -36,7 +36,6 @@ const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
 const crypto = require('node:crypto');
-const readline = require('node:readline');
 const { spawn } = require('node:child_process');
 
 const HOME = os.homedir();
@@ -51,6 +50,7 @@ const KEEP_DAYS = 90;
 const POST_TIMEOUT_MS = 8000;
 // 会话进行中（Stop 钩子）最多每 10 分钟推一次：「今日」组件在长会话里也能跟着动
 const TICK_MS = 10 * 60 * 1000;
+const CHECKPOINT_MS = 60 * 1000;
 const DEBUG = !!process.env.NUMABLE_USAGE_DEBUG;
 const ALL_MODELS = process.env.NUMABLE_USAGE_MODELS === 'all';
 
@@ -81,7 +81,11 @@ const normModel = (m) => {
 // 否则后写的覆盖先写的（白扫一遍）、首次接入还会各建一个空间。
 const LOCK = path.join(STATE_DIR, 'lock');
 const LOCK_WAIT_MS = 20000;               // > 一次推送超时，排在后面的会话等得到
+// 持锁进程每 LOCK_BEAT_MS 刷一次锁文件 mtime;超过 LOCK_STALE_MS 没刷 = 挂死 / pid 被复用。
+// ⚠️ 不能按「锁拿了多久」判过期:会话记录大的机器一次全量扫描能跑十几分钟,
+// 曾经活锁满 10 分钟就被下一个钩子抢走 → 又一个从头全量的进程,越抢越慢,滚成好几个各占满一核。
 const LOCK_STALE_MS = 10 * 60 * 1000;
+const LOCK_BEAT_MS = 30 * 1000;
 
 const pidAlive = (pid) => {
   if (!Number.isInteger(pid) || pid <= 0) return false;
@@ -99,7 +103,7 @@ function tryLock(lockPath) {
     } catch (e) {
       if (e.code !== 'EEXIST') throw e;
     }
-    // 持锁进程已经不在了（被杀 / 崩溃）或锁太旧 → 清掉再试一次
+    // 持锁进程已经不在了（被杀 / 崩溃）或心跳停了（挂死 / pid 被复用）→ 清掉再试一次
     let stale;
     try {
       const raw = fs.readFileSync(lockPath, 'utf8');
@@ -115,10 +119,20 @@ function tryLock(lockPath) {
   return false;
 }
 
-async function acquireLock(lockPath = LOCK, waitMs = LOCK_WAIT_MS) {
+async function acquireLock(lockPath = LOCK, waitMs = LOCK_WAIT_MS, beatMs = LOCK_BEAT_MS) {
   const until = Date.now() + waitMs;
   for (;;) {
-    if (tryLock(lockPath)) return () => { try { fs.unlinkSync(lockPath); } catch { /* 已被清 */ } };
+    if (tryLock(lockPath)) {
+      const beat = setInterval(() => {
+        try { const t = new Date(); fs.utimesSync(lockPath, t, t); } catch { /* 被清了:释放时也不会删别人的 */ }
+      }, beatMs);
+      beat.unref();
+      return () => {
+        clearInterval(beat);
+        // 只删自己的锁:万一被判过期抢走了,删掉的就是别人的活锁
+        try { if (fs.readFileSync(lockPath, 'utf8') === String(process.pid)) fs.unlinkSync(lockPath); } catch { /* 已被清 */ }
+      };
+    }
     if (Date.now() >= until) return null;
     await new Promise((r) => setTimeout(r, 150));
   }
@@ -195,6 +209,37 @@ function touchSession(sessions, sid, ts) {
 }
 
 // ---------- 增量扫描 ----------
+/**
+ * 逐行读文件 [start, end) 区间。比 readline 快约一倍:直接在 Buffer 上找换行,只解码要的行。
+ * 全量扫描时这层是大头(会话记录九成字节是工具结果,逃不掉 JSON.parse,至少别再多付一遍切分 / 解码)。
+ * 每读一块让出一次事件循环 —— 锁心跳靠它。
+ */
+async function eachLine(f, start, end, onLine) {
+  const CHUNK = 1 << 20;
+  let fh;
+  try {
+    fh = await fs.promises.open(f, 'r');
+    let pos = start, rest = null;
+    while (pos < end) {
+      const buf = Buffer.allocUnsafe(Math.min(CHUNK, end - pos));
+      const { bytesRead } = await fh.read(buf, 0, buf.length, pos);
+      if (!bytesRead) break;
+      pos += bytesRead;
+      let b = buf.subarray(0, bytesRead);
+      if (rest) { b = Buffer.concat([rest, b]); rest = null; }
+      let s = 0;
+      for (let i = b.indexOf(0x0a); i >= 0; i = b.indexOf(0x0a, s)) {
+        if (i > s) onLine(b.toString('utf8', s, i));
+        s = i + 1;
+      }
+      if (s < b.length) rest = Buffer.from(b.subarray(s));
+    }
+    if (rest && rest.length) onLine(rest.toString('utf8'));
+  } catch { /* 读不到 = 文件被删 / 无权限,当没有 */ } finally {
+    if (fh) await fh.close().catch(() => {});
+  }
+}
+
 function listJsonl(root) {
   const out = [];
   const walk = (d) => {
@@ -342,15 +387,8 @@ async function backfillReview(history, root = PROJECTS) {
     if (!prev || !(prev.off > 0)) continue;
     let mt = 0; try { mt = fs.statSync(f).mtimeMs; } catch { continue; }
     if (mt < since) continue;
-    await new Promise((resolve) => {
-      const rs = fs.createReadStream(f, { start: 0, end: prev.off - 1, encoding: 'utf8' });
-      const rl = readline.createInterface({ input: rs, crlfDelay: Infinity });
-      rl.on('line', (line) => {
-        if (!line) return;
-        try { reviewRow(history.days, JSON.parse(line), history, minDay); } catch { /* 坏行 */ }
-      });
-      rl.on('close', resolve);
-      rs.on('error', () => resolve());
+    await eachLine(f, 0, prev.off, (line) => {
+      try { reviewRow(history.days, JSON.parse(line), history, minDay); } catch { /* 坏行 */ }
     });
   }
   history.reviewV = 1;
@@ -538,7 +576,7 @@ function lastLineEnd(f, from, size) {
 // 超过这个时长没动过的文件不会再续写同一个响应，不必留去重键（history 保持小）
 const RECENT_TTL_MS = 2 * 864e5;
 
-async function scan(history, root = PROJECTS) {
+async function scan(history, root = PROJECTS, onFile) {
   if (!fs.existsSync(root)) { log('no projects dir'); return 0; }
   const files = listJsonl(root);
   let touched = 0;
@@ -564,15 +602,8 @@ async function scan(history, root = PROJECTS) {
     try { off = lastLineEnd(f, from, fst.size); } catch { continue; }
 
     if (off > from) {
-      await new Promise((resolve) => {
-        const rs = fs.createReadStream(f, { start: from, end: off - 1, encoding: 'utf8' });
-        const rl = readline.createInterface({ input: rs, crlfDelay: Infinity });
-        rl.on('line', (line) => {
-          if (!line) return;
-          try { absorb(history.days, JSON.parse(line), st, history); } catch { /* 坏行，丢弃 */ }
-        });
-        rl.on('close', resolve);
-        rs.on('error', () => resolve());
+      await eachLine(f, from, off, (line) => {
+        try { absorb(history.days, JSON.parse(line), st, history); } catch { /* 坏行，丢弃 */ }
       });
     }
 
@@ -583,6 +614,7 @@ async function scan(history, root = PROJECTS) {
     }
     history.files[f] = entry;
     touched++;
+    if (onFile) onFile();
   }
   flushAct();
   return touched;
@@ -1036,6 +1068,8 @@ async function main() {
 }
 
 async function runCollect() {
+  // 后台采集让着前台:全量扫描是满核的活,别跟编辑器 / 编译抢 CPU
+  try { os.setPriority(19); } catch { /* 没权限就照常跑 */ }
   // 读-改-写 config / history 全程持锁；拿不到（别的会话正在采集）就放弃这一轮 ——
   // 它会顺带把本会话已写下的行也扫进去，漏掉的尾巴下一次 hook 触发时补上。
   const release = await acquireLock();
@@ -1069,7 +1103,17 @@ async function collectAndPush({ force = false } = {}) {
 
   const history = loadHistory();
   REVIEW_TITLES = cfg.titles === true;
-  let touched = await scan(history);
+  // 从空历史扫起时,回顾已由 absorb → reviewRow 逐行算好 —— 不必再回补一遍(那会把近 14 天的文件从头再读一次)
+  if (!Object.keys(history.files).length) { history.reviewV = 1; history.reviewT = REVIEW_TITLES; }
+  // 全量扫描每隔一段落一次盘:中途被杀(合盖 / 关机)下次接着扫,不从头来
+  let lastSave = Date.now();
+  let touched = await scan(history, PROJECTS, () => {
+    if (Date.now() - lastSave < CHECKPOINT_MS) return;
+    flushAct();
+    writeJson(HISTORY, history);
+    lastSave = Date.now();
+    log('checkpoint');
+  });
   // 每日回顾:第一次升级到 0.9.0、或标题开关变了 → 回补近 14 天(只重算回顾,别的不动)
   if (history.reviewV !== 1 || history.reviewT !== REVIEW_TITLES) {
     await backfillReview(history);

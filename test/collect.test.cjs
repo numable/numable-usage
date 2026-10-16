@@ -149,6 +149,31 @@ test('锁：持有期间别人拿不到；持锁进程已死则可抢', async ()
   assert.equal(C.tryLock(lock), true);
 });
 
+test('锁:持锁进程活着就靠心跳续命,拿得再久也不许抢;释放时只删自己的锁', async () => {
+  const lock = path.join(tmp(), 'lock');
+  const release = await C.acquireLock(lock, 0, 40);
+  // 模拟已经扫了一个小时:锁文件 mtime 很旧。没有心跳时下一个钩子会判过期抢走 → 两个进程同时全量扫描
+  const old = new Date(Date.now() - 3600e3);
+  fs.utimesSync(lock, old, old);
+  await new Promise((r) => setTimeout(r, 150));
+  assert.equal(C.tryLock(lock), false);
+  // 锁万一被别人拿走了(这里写成 pid 1,恒存活),释放时不许把别人的锁删掉
+  fs.writeFileSync(lock, '1');
+  release();
+  assert.equal(fs.readFileSync(lock, 'utf8'), '1');
+});
+
+test('逐行读:跨块的超长行、多字节字符落在块边界、CRLF 都按原样计', async () => {
+  const root = tmp();
+  const f = path.join(root, 'a.jsonl');
+  const long = JSON.stringify(user('中'.repeat(700000)));       // ≈ 2.1MB,跨两个 1MB 块,且「中」是 3 字节
+  fs.writeFileSync(f, JSON.stringify(user('a')) + '\r\n' + long + '\n' + jsonl(user('b')));
+  const h = C.loadHistory(path.join(root, 'none.json'));
+  await C.scan(h, root);
+  assert.equal(h.days[DAY].msgs, 3);
+  assert.equal(h.files[f].off, fs.statSync(f).size);
+});
+
 test('多个会话同时首次触发：只建一个空间、history 不写坏、数字不重不漏', async (t) => {
   const home = tmp();
   const state = path.join(home, 'state');
