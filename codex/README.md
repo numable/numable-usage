@@ -101,4 +101,12 @@ node --test test/codex-collect.test.cjs test/codex-cli.test.cjs test/codex-quota
 node --test test/codex-worker.test.cjs
 ```
 
+已启动独立本机服务时，可运行模拟双电脑接入闭环（临时配置与虚构日志，不修改真实 Codex 设置）：
+
+```sh
+node service/scripts/verify-codex-cli.mjs
+```
+
+默认连接 `http://127.0.0.1:8797`，可用 `CODEX_VERIFY_BASE` 改成本机其他端口，脚本拒绝公网端点。这验证协议与命令行协作，不能代替两台真实电脑的操作系统验收。
+
 Windows、不同 Codex 入口、四端真机与线上发布进度见 meta 仓 `doc/codex-usage-impl-plan.md`，不能用本机测试通过代替。
