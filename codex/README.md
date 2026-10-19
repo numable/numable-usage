@@ -38,9 +38,12 @@ node codex/cli.cjs export
 ```sh
 node codex/cli.cjs quota
 node codex/cli.cjs quota --codex-binary /自己的/Codex可执行文件
+node codex/cli.cjs quota-auto-on
 ```
 
 主动读取通过本机 Codex 协议完成，不创建会话，不要求复制 OpenAI 登录凭证。账号标识在本机匿名化；加入同一空间后使用空间范围的匿名标识，以便服务端合并同账号多台电脑的额度。不能识别账号的日志快照按设备分别展示。
+
+`quota-auto-on` 显式开启每五分钟读取，需后台采集运行；`quota-auto-off` 关闭。多个目录分别连接，单个目录失败会保留其旧观测并标注不完整。macOS 的命令行启动器不可用时，会尝试已安装桌面端的内置可执行文件；也可显式指定路径。
 
 ## 手机同步
 
@@ -63,7 +66,8 @@ node codex/cli.cjs credentials --state-dir /自己的/测试状态目录
 
 ```sh
 node codex/cli.cjs install
-node codex/cli.cjs watch
+node codex/cli.cjs live-on
+node codex/cli.cjs start
 node codex/cli.cjs stop
 node codex/cli.cjs uninstall
 ```
@@ -71,6 +75,10 @@ node codex/cli.cjs uninstall
 安装只追加本工具的事件钩子，保留已有钩子。安装之后，需要在 Codex 中检查并信任新增定义才会执行；采集器不会绕过信任检查。卸载只移除完整匹配的本工具定义，保留本机历史并暂停同步。
 
 事件钩子立即启动不持有原会话输入输出的后台采集进程。`watch` 可在终端保持运行，每 60 秒补偿扫描；`stop` 通过本工具的停止标记请求退出，不根据一个旧 PID 杀进程。
+
+`start` 在后台运行并确认进程取得采集锁，重复启动复用现有进程。实时默认关闭，`live-on` 开启，`live-off` 清除本机实时视图并在下次同步时清空服务端本设备实时视图；`live` 查看当前投影。钩子先脱敏入队，采集锁繁忙时继续排队，不等待采集完成。状态只由真实事件更新，无事件时不会通过扫描伪造心跳。
+
+服务实时视图只保留最近 24 小时、最多 40 个会话与每会话最近 60 轮；传输接近上限时继续裁旧轮并显示省略数量。轮次结束、失败、中断、会话结束分别显示。只有明确目标完成事件才触发目标完成提醒，不保存目标正文。
 
 ## 数据与隐私
 

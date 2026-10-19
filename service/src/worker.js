@@ -1076,7 +1076,7 @@ async function handle(req, env, ctx) {
     // ?today= 只在离服务器时间 3 天以内才认 —— 各时区的「今天」都落在这个窗里，再远就是参数写错了
     const q = url.searchParams.get('today') || '';
     const anchor = DATE_RE.test(q) && Math.abs(Date.parse(q + 'T12:00:00Z') - Date.now()) < 3 * 864e5 ? q : '';
-    const merged = selectedSource === 'codex' ? mergeCodex(sources.codex || [], anchor) : mergeClaudeCode(sources['claude-code'] || [], anchor);
+    const merged = selectedSource === 'codex' ? mergeCodex(sources.codex || [], anchor, Date.now(), { quotaThreshold: url.searchParams.has('quotaThreshold') ? Number(url.searchParams.get('quotaThreshold')) : undefined }) : mergeClaudeCode(sources['claude-code'] || [], anchor);
     // ?lite=1：只要合并视图（组件 / 页面用）；各设备原样快照只有 --devices 这类工具才要
     return json(url.searchParams.get('lite') === '1' ? { updatedAt, merged } : { updatedAt, merged, sources });
   }
@@ -1095,7 +1095,7 @@ async function handle(req, env, ctx) {
     if (req.method === 'GET') return stub.fetch('https://live/notify' + url.search);
     const raw = await req.text();
     if (raw.length > 4096) return err('payload_too_large', 413);
-    return stub.fetch('https://live/notify', { method: 'POST', body: raw, headers: { 'content-type': 'application/json' } });
+    return stub.fetch('https://live/notify' + url.search, { method: 'POST', body: raw, headers: { 'content-type': 'application/json' } });
   }
 
   // 手机请求「在电脑上打开实时会话」(读令牌:手机只有它)。只记一个时刻,电脑下一次 /ingest 时取走;
@@ -1127,7 +1127,7 @@ async function handle(req, env, ctx) {
     if (!/^[a-f0-9]{4,32}$/.test(dev)) return err('bad_device');
     const raw = await req.text();
     if (raw.length > LIVE_MAX_BODY) return err('payload_too_large', 413);
-    return stub.fetch('https://live/?dev=' + dev, { method: 'POST', body: raw, headers: { 'content-type': 'application/json' } });
+    return stub.fetch(`https://live/?dev=${dev}&source=${source}`, { method: 'POST', body: raw, headers: { 'content-type': 'application/json' } });
   }
 
   return err('not_found', 404);

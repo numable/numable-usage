@@ -1,6 +1,9 @@
 'use strict';
 const { spawn } = require('node:child_process');
 const readline = require('node:readline');
+const path = require('node:path');
+const fs = require('node:fs');
+const os = require('node:os');
 const { quota, hash } = require('./collect.cjs');
 
 // 只建立协议连接并读取额度，不创建、恢复或修改会话，不读取登录凭证文件。
@@ -46,4 +49,32 @@ function readQuota({ binary = process.env.NUMABLE_CODEX_BINARY || 'codex', home,
     send({ id: 1, method: 'initialize', params: { clientInfo: { name: 'numable_codex_usage', version: '0.1.0' }, capabilities: { experimentalApi: true } } });
   });
 }
-module.exports = { readQuota };
+async function readQuotaHomes({ homes, salt, profileSalt = salt, previous, ...options }) {
+  const readOne = async (home) => {
+    try { return await readQuota({ ...options, home, salt }); }
+    catch (error) {
+      if (options.binary || process.env.NUMABLE_CODEX_BINARY || process.platform !== 'darwin') throw error;
+      const relative = 'ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex';
+      const candidates = [path.join('/Applications', relative), path.join(os.homedir(), 'Applications', relative)];
+      for (const binary of candidates) if (fs.existsSync(binary)) {
+        try { return await readQuota({ ...options, binary, home, salt }); } catch {}
+      }
+      throw error;
+    }
+  };
+  const results = await Promise.allSettled(homes.map(readOne));
+  const quotas = [];
+  let failures = 0;
+  results.forEach((r, i) => {
+    const profile = hash(profileSalt, `profile:${path.resolve(homes[i])}`);
+    if (r.status !== 'fulfilled') {
+      failures++;
+      if (previous?.scope === hash(salt, 'quota-scope')) quotas.push(...(previous.quotas || []).filter((q) => q.profile === profile));
+      return;
+    }
+    quotas.push(...r.value.quotas.map((q) => ({ ...q, profile })));
+  });
+  return { observedAt: Date.now(), scope: hash(salt, 'quota-scope'), supported: quotas.length > 0,
+    failures, profileCount: homes.length, quotas };
+}
+module.exports = { readQuota, readQuotaHomes };

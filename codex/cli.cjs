@@ -6,7 +6,8 @@ const os = require('node:os');
 const crypto = require('node:crypto');
 const { spawn } = require('node:child_process');
 const { collect, initialState, atomicWrite, hash } = require('./lib/collect.cjs');
-const { readQuota } = require('./lib/quota.cjs');
+const { readQuotaHomes } = require('./lib/quota.cjs');
+const { sanitizeHook, absorbHook, buildLive } = require('./lib/live.cjs');
 
 function parse(args) {
   const out = { command: args[0] || 'status', homes: [] };
@@ -16,7 +17,7 @@ function parse(args) {
       const value = args[++i]; if (!value || value.startsWith('--')) throw new Error('选项缺少参数');
       if (key === '--home') out.homes.push(path.resolve(value));
       else out[key.slice(2).replace(/-([a-z])/g, (_, c) => c.toUpperCase())] = value;
-    } else if (['--json', '--quiet', '--rebuild'].includes(key)) out[key.slice(2)] = true;
+    } else if (['--json', '--quiet', '--rebuild', '--hook-worker'].includes(key)) out[key.slice(2).replace(/-([a-z])/g, (_, c) => c.toUpperCase())] = true;
     else throw new Error('无法识别选项，请运行 help 查看用法');
   }
   return out;
@@ -39,14 +40,15 @@ function endpoint(value) {
 }
 function configFor(args, p) {
   const saved = read(p.config, null);
-  const homes = args.homes.length ? args.homes : saved?.homes || [path.resolve(process.env.CODEX_HOME || path.join(os.homedir(), '.codex'))];
+  const homes = [...new Set((args.homes.length ? args.homes : saved?.homes || [path.resolve(process.env.CODEX_HOME || path.join(os.homedir(), '.codex'))]).map((h) => path.resolve(h)))];
   const timezone = args.timezone || saved?.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone;
   try { new Intl.DateTimeFormat('en', { timeZone: timezone }).format(); } catch { throw new Error('时区无效'); }
   if (args.projects && !['on', 'off'].includes(args.projects)) throw new Error('项目名称选项必须是 on 或 off');
   const projects = args.projects ? args.projects === 'on' : saved?.projects || false;
   const target = endpoint(args.endpoint || saved?.endpoint || process.env.NUMABLE_USAGE_ENDPOINT || 'https://usage.numable.app');
   if (saved?.writeToken && saved.endpoint !== target) throw new Error('已绑定的凭证不能发送到另一个服务，请使用独立状态目录');
-  return { version: 1, ...saved, homes, timezone, projects, endpoint: target,
+  return { version: 1, ...saved, homes, timezone, projects, endpoint: target, live: saved?.live === true,
+    salt: saved?.salt || crypto.randomBytes(32).toString('hex'),
     device: saved?.device || crypto.randomBytes(12).toString('hex'), sync: saved?.sync || false };
 }
 function lock(file) {
@@ -60,7 +62,7 @@ function lock(file) {
       if (e.code !== 'EEXIST') throw e;
       const previous = read(file, {});
       if (!Number.isSafeInteger(previous.pid) || previous.pid <= 0) throw new Error('采集锁无效，请检查本机状态');
-      try { process.kill(previous.pid, 0); throw new Error('已有采集正在进行'); }
+      try { process.kill(previous.pid, 0); throw Object.assign(new Error('已有采集正在进行'), { code: 'LOCK_BUSY' }); }
       catch (err) { if (err.code !== 'ESRCH') throw err; }
       fs.unlinkSync(file);
     }
@@ -81,8 +83,8 @@ async function request(config, route, body, token) {
 const shellQuote = (s) => process.platform === 'win32' ? `"${s.replace(/"/g, '""')}"` : `'${s.replace(/'/g, "'\\''")}'`;
 function hookDefinitions(p) {
   const command = [process.execPath, __filename, 'hook', '--state-dir', p.dir].map(shellQuote).join(' ');
-  return ['SessionStart', 'SessionEnd', 'Stop', 'UserPromptSubmit', 'PermissionRequest', 'PostToolUse', 'Interrupt'].map((event) => ({ event,
-    group: { hooks: [{ type: 'command', command, ...(event === 'SessionEnd' ? {} : { async: true }), timeout: 10 }] } }));
+  return ['SessionStart', 'SessionEnd', 'Stop', 'UserPromptSubmit', 'PermissionRequest', 'PreToolUse', 'PostToolUse', 'PreCompact', 'SubagentStart', 'SubagentStop', 'Interrupt'].map((event) => ({ event,
+    group: { hooks: [{ type: 'command', command, ...(event === 'SessionEnd' ? {} : { async: true }), timeout: event === 'Interrupt' ? 3 : 10 }] } }));
 }
 function installHooks(config, p) {
   const installed = [];
@@ -113,9 +115,18 @@ function uninstallHooks(config) {
     atomicWrite(file, doc);
   }
 }
+function pendingEvents(p) {
+  try { return fs.readdirSync(path.join(p.dir, 'events')).some((f) => f.endsWith('.json')); } catch { return false; }
+}
+function spawnEventWorker(p) {
+  const child = spawn(process.execPath, [__filename, 'collect', '--state-dir', p.dir, '--quiet', '--hook-worker'], { detached: true, stdio: 'ignore', windowsHide: true });
+  child.on('error', () => {}); child.unref();
+}
 async function scan(args, p, config) {
   const unlock = lock(p.lock);
   try {
+    // 等锁的期间可能已有其他采集更新序号或开关；取得锁后再读权威配置。
+    if (fs.existsSync(p.config)) config = configFor(args, p);
     let existing;
     try { existing = read(p.history, null); }
     catch (error) {
@@ -124,19 +135,73 @@ async function scan(args, p, config) {
       fs.copyFileSync(p.history, backup); fs.chmodSync(backup, 0o600);
       existing = null;
     }
-    const state = args.rebuild ? { ...initialState(), ...(existing?.salt ? { salt: existing.salt } : {}) } : existing || initialState();
-    const r = await collect(config.homes, state, { timezone: config.timezone, projects: config.projects });
-    const activeQuota = read(path.join(p.dir, 'quota.json'), null);
-    const latestLog = Math.max(0, ...r.snapshot.quotas.map((q) => q.observedAt));
-    if (activeQuota?.supported && activeQuota.scope === hash(config.writeToken || state.salt, 'quota-scope') && activeQuota.observedAt >= latestLog) {
-      r.snapshot.quotas = activeQuota.quotas;
+    if (existing?.salt) config.salt = existing.salt;
+    const state = args.rebuild ? { ...initialState(), salt: config.salt } : existing || { ...initialState(), salt: config.salt };
+    const queueDir = path.join(p.dir, 'events');
+    let queued = []; try { queued = fs.readdirSync(queueDir).filter((name) => /^[a-zA-Z0-9.-]+\.json$/.test(name)).map((name) => ({ file: path.join(queueDir, name), event: read(path.join(queueDir, name), null) })); } catch (e) { if (e.code !== 'ENOENT') throw e; }
+    const r = await collect(config.homes, state, { timezone: config.timezone, projects: config.projects, live: config.live });
+    let activeQuota = read(path.join(p.dir, 'quota.json'), null);
+    if (config.quotaAuto && Date.now() - (config.lastQuotaAttempt || 0) >= 300000) {
+      config.lastQuotaAttempt = Date.now();
+      try {
+        activeQuota = await readQuotaHomes({ binary: config.quotaBinary, homes: config.homes, salt: config.writeToken || state.salt, profileSalt: state.salt, previous: activeQuota });
+        atomicWrite(path.join(p.dir, 'quota.json'), activeQuota);
+        config.quotaStatus = activeQuota.supported ? activeQuota.failures ? 'partial' : 'ready' : 'unavailable';
+      } catch { config.quotaStatus = 'unavailable'; }
     }
-    if (!config.projects) for (const f of Object.values(r.state.files)) f.projectName = null;
+    if (activeQuota?.supported && activeQuota.scope === hash(config.writeToken || state.salt, 'quota-scope')) {
+      const allowedProfiles = new Set(config.homes.map((home) => hash(state.salt, `profile:${path.resolve(home)}`)));
+      const profiles = new Set(activeQuota.quotas.filter((q) => allowedProfiles.has(q.profile)).map((q) => q.profile));
+      for (const profile of profiles) {
+        const latestLog = Math.max(0, ...r.snapshot.quotas.filter((q) => q.profile === profile).map((q) => q.observedAt));
+        const active = activeQuota.quotas.filter((q) => q.profile === profile);
+        if (active.length && Math.max(...active.map((q) => q.observedAt)) >= latestLog) r.snapshot.quotas = [...r.snapshot.quotas.filter((q) => q.profile !== profile), ...active];
+      }
+    }
+    r.snapshot.quotaDiagnostics = { failures: activeQuota?.failures || 0, profiles: activeQuota?.profileCount || config.homes.length };
+    if (config.live) {
+      r.state.liveHooks ||= { sessions: {} };
+      for (const q of queued.sort((a, b) => (a.event?.at || 0) - (b.event?.at || 0))) absorbHook(r.state.liveHooks, q.event);
+      for (const [id, s] of Object.entries(r.state.liveHooks.sessions)) if (s.lastAt < Date.now() - 24 * 3600e3) delete r.state.liveHooks.sessions[id];
+    } else delete r.state.liveHooks;
+    if (!config.projects) {
+      for (const f of Object.values(r.state.files)) { f.projectName = null; if (f.live) f.live.projectName = null; }
+      for (const s of Object.values(r.state.liveHooks?.sessions || {})) s.projectName = null;
+    }
+    const live = config.live ? buildLive(r.state, { projects: config.projects }) : { tier: 1, devNow: Date.now(), sessions: [] };
     atomicWrite(p.history, r.state);
     atomicWrite(p.snapshot, { ...r.snapshot, collection: r.stats });
-    atomicWrite(p.config, { ...config, lastCollect: r.snapshot.collectedAt });
+    atomicWrite(path.join(p.dir, 'live.json'), live);
+    for (const q of queued) try { fs.unlinkSync(q.file); } catch {}
+    config.lastCollect = r.snapshot.collectedAt; atomicWrite(p.config, config);
     if (config.sync && config.writeToken) {
-      await request(config, '/ingest', { source: 'codex', device: config.device, snapshot: { ...r.snapshot, collection: r.stats } }, config.writeToken);
+      const background = args.hookWorker || args.command === 'watch';
+      const pending = []; let syncError = null;
+      if (!background || Date.now() - (config.lastStatsPush || 0) >= 60000) {
+        pending.push((async () => {
+          try {
+            await request(config, '/ingest', { source: 'codex', device: config.device, snapshot: { ...r.snapshot, collection: r.stats } }, config.writeToken);
+            config.lastStatsPush = Date.now();
+          } catch (error) { syncError ||= error; }
+        })());
+      }
+      const fingerprint = crypto.createHash('sha256').update(JSON.stringify({ tier: live.tier, sessions: live.sessions })).digest('hex');
+      if ((config.live || config.liveClearPending) && (fingerprint !== config.lastLiveFingerprint || Date.now() - (config.lastLivePush || 0) >= 60000)) {
+        config.lastLiveSequence = (config.lastLiveSequence || 0) + 1;
+        atomicWrite(p.config, config);
+        const seq = config.lastLiveSequence;
+        pending.push((async () => {
+          try {
+            const wait = (config.lastLivePush || 0) + 2000 - Date.now();
+            if (args.hookWorker && wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
+            await request(config, `/live?source=codex&dev=${config.device}`, { ...live, seq }, config.writeToken);
+            config.lastLivePush = Date.now(); config.lastLiveFingerprint = fingerprint; config.liveClearPending = false;
+          } catch (error) { syncError ||= error; }
+        })());
+      }
+      await Promise.all(pending); config.syncError = !!syncError;
+      atomicWrite(p.config, config);
+      if (syncError) throw syncError;
     }
     return { ...r.snapshot, collection: r.stats };
   } finally { unlock(); }
@@ -144,31 +209,66 @@ async function scan(args, p, config) {
 async function main(argv = process.argv.slice(2)) {
   const args = parse(argv), p = paths(args);
   if (args.command === 'help' || args.command === '--help') {
-    console.log('Codex 用量\ninit：初始化本机采集（默认不同步）\ncollect：增量采集；--rebuild：重算\nsummary：查看统计；--json：导出纯数字快照\nstatus：查看采集与同步状态\nquota：主动读取额度；--codex-binary 指定 Codex\ndevices：列出已接入电脑\nforget：删除 --device 指定的其他电脑数据\nconnect：创建读取凭证并开启同步\ncredentials：显示手机使用的读取凭证\npause：暂停同步\nresume：恢复已绑定的同步\njoin：从标准输入读取另一台电脑生成的加入串\nlink：生成供自己另一台电脑使用的加入串\ninstall：安装事件钩子（之后需在 Codex 中信任）\nuninstall：仅移除本工具安装的钩子，保留本机记录\nwatch：每 60 秒补充采集；stop：请求停止后台采集\n通用选项：--home 目录（可重复）、--state-dir 目录、--timezone 时区、--endpoint 服务地址、--projects on|off');
+    console.log('Codex 用量\ninit：初始化本机采集（默认不同步）\ncollect：增量采集；--rebuild：重算\nsummary：查看统计；--json：导出纯数字快照\nstatus：查看采集与同步状态\nquota：主动读取额度；--codex-binary 指定 Codex\nquota-auto-on/off：开启或关闭每五分钟读取额度\nlive-on/off：开启或关闭匿名实时状态；live：查看实时投影\ndevices：列出已接入电脑\nforget：删除 --device 指定的其他电脑数据\nconnect：创建读取凭证并开启同步\ncredentials：显示手机使用的读取凭证\npause：暂停同步\nresume：恢复已绑定的同步\njoin：从标准输入读取另一台电脑生成的加入串\nlink：生成供自己另一台电脑使用的加入串\ninstall：安装事件钩子（之后需在 Codex 中信任）\nuninstall：仅移除本工具安装的钩子，保留本机记录\nstart：后台启动并确认运行；watch：在前台每 60 秒补充采集；stop：请求停止后台采集\n通用选项：--home 目录（可重复）、--state-dir 目录、--timezone 时区、--endpoint 服务地址、--projects on|off');
     return;
   }
   const config = configFor(args, p);
   const output = (data) => { if (!args.quiet) console.log(typeof data === 'string' ? data : JSON.stringify(data, null, 2)); };
   if (args.command === 'hook') {
-    // 子进程不持有钩子的标准输入输出，故障不能阻塞用户会话。
-    process.stdin.resume();
-    const child = spawn(process.execPath, [__filename, 'collect', '--state-dir', p.dir, '--quiet'], { detached: true, stdio: 'ignore', windowsHide: true });
-    child.on('error', () => {}); child.unref();
+    // 先在父进程丢掉敏感字段，原始输入既不落盘，也不出现在进程参数中。
+    let text = '', overflow = false;
+    for await (const chunk of process.stdin) { if (!overflow) { text += chunk; if (text.length > 2 * 1024 * 1024) { overflow = true; text = ''; } } }
+    if (!fs.existsSync(p.config)) { process.stdout.write('{}\n'); return; }
+    let event = null; try { if (config.live && !overflow) event = sanitizeHook(JSON.parse(text), config.salt, { projects: config.projects }); } catch {}
+    atomicWrite(path.join(p.dir, 'events', `${Date.now()}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.json`), event || { scan: true, at: Date.now() });
+    let workerRunning = false;
+    try { const lease = read(path.join(p.dir, 'event-worker.lock'), null); if (lease?.pid) { process.kill(lease.pid, 0); workerRunning = true; } } catch {}
+    if (!workerRunning) spawnEventWorker(p);
+    process.stdout.write('{}\n');
     return;
   }
   if (args.command === 'init') { atomicWrite(p.config, config); output('本机采集已初始化，手机同步尚未开启'); return; }
-  if (args.command === 'collect') { output(await scan(args, p, config)); return; }
+  if (args.command === 'collect') {
+    if (args.hookWorker) {
+      let release;
+      try { release = lock(path.join(p.dir, 'event-worker.lock')); } catch (error) { if (error.code === 'LOCK_BUSY') return; throw error; }
+      try {
+        for (let i = 0; i < 600; i++) {
+          if (!pendingEvents(p)) return;
+          try { await scan(args, p, configFor(args, p)); }
+          catch (error) { if (error.code !== 'LOCK_BUSY') throw error; await new Promise((resolve) => setTimeout(resolve, 100)); }
+        }
+      } finally { release(); if (pendingEvents(p)) spawnEventWorker(p); }
+      return;
+    }
+    output(await scan(args, p, config)); return;
+  }
+  if (args.command === 'live-on' || args.command === 'live-off') {
+    config.live = args.command === 'live-on'; config.liveClearPending = !config.live;
+    atomicWrite(p.config, config); await scan(args, p, config);
+    output(config.live ? '实时状态已开启；手机同步沿用当前开关' : '实时状态已关闭'); return;
+  }
+  if (args.command === 'live') { output(read(path.join(p.dir, 'live.json'), { tier: 1, sessions: [] })); return; }
   if (args.command === 'quota') {
     const unlock = lock(p.lock);
     try {
-      const state = read(p.history, null) || initialState();
-      const result = await readQuota({ binary: args.codexBinary, home: config.homes[0], salt: config.writeToken || state.salt });
-      atomicWrite(p.history, state); atomicWrite(path.join(p.dir, 'quota.json'), result);
+      const state = read(p.history, null) || { ...initialState(), salt: config.salt };
+      config.salt = state.salt;
+      const result = await readQuotaHomes({ binary: args.codexBinary || config.quotaBinary, homes: config.homes, salt: config.writeToken || state.salt, profileSalt: state.salt,
+        previous: read(path.join(p.dir, 'quota.json'), null) });
+      atomicWrite(p.history, state); atomicWrite(p.config, config); atomicWrite(path.join(p.dir, 'quota.json'), result);
       const snapshot = read(p.snapshot, null);
       if (snapshot && result.supported) atomicWrite(p.snapshot, { ...snapshot, quotas: result.quotas });
       output(result);
     } finally { unlock(); }
     return;
+  }
+  if (args.command === 'quota-auto-on' || args.command === 'quota-auto-off') {
+    config.quotaAuto = args.command === 'quota-auto-on';
+    if (args.codexBinary) config.quotaBinary = args.codexBinary;
+    if (config.quotaAuto) config.lastQuotaAttempt = 0;
+    atomicWrite(p.config, config); if (config.quotaAuto) await scan(args, p, config);
+    output(config.quotaAuto ? '额度自动读取已开启，每五分钟检查一次；请保持后台采集运行' : '额度自动读取已关闭'); return;
   }
   if (['summary', 'export'].includes(args.command)) {
     const snapshot = read(p.snapshot, null);
@@ -177,7 +277,8 @@ async function main(argv = process.argv.slice(2)) {
   }
   if (args.command === 'status') {
     const snapshot = read(p.snapshot, null);
-    output({ initialized: fs.existsSync(p.config), sync: config.sync, paired: !!config.writeToken,
+    output({ initialized: fs.existsSync(p.config), sync: config.sync, paired: !!config.writeToken, live: config.live,
+      quotaAuto: config.quotaAuto === true, quotaStatus: config.quotaStatus || null, syncError: config.syncError || null,
       collectedAt: snapshot?.collectedAt || null, timezone: config.timezone, projects: config.projects,
       coverage: snapshot?.coverage || [], diagnostics: snapshot?.diagnostics || null, collection: snapshot?.collection || null,
       hooksInstalled: !!config.installed?.length, hooksTrust: config.installed?.length ? 'check-in-codex' : null });
@@ -236,6 +337,21 @@ async function main(argv = process.argv.slice(2)) {
     atomicWrite(path.join(p.dir, 'stop.json'), { at: Date.now() }); output('已移除本工具的事件钩子并暂停同步，本机记录仍保留'); return;
   }
   if (args.command === 'stop') { atomicWrite(path.join(p.dir, 'stop.json'), { at: Date.now() }); output('已请求停止后台采集'); return; }
+  if (args.command === 'start') {
+    if (!fs.existsSync(p.config)) throw new Error('请先运行 init 初始化本机采集');
+    const watchLock = path.join(p.dir, 'watch.lock'), previous = read(watchLock, null);
+    if (previous?.pid) {
+      try { process.kill(previous.pid, 0); output('后台采集已在运行'); return; }
+      catch (e) { if (e.code !== 'ESRCH') throw e; }
+    }
+    const child = spawn(process.execPath, [__filename, 'watch', '--state-dir', p.dir, '--quiet'], { detached: true, stdio: 'ignore', windowsHide: true });
+    let failed = false; child.once('error', () => { failed = true; }); child.unref();
+    for (let i = 0; i < 40 && !failed; i++) {
+      if (read(watchLock, null)?.pid === child.pid) { output('后台采集已启动'); return; }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    throw new Error('未能确认后台采集启动，请运行 watch 查看状态');
+  }
   if (args.command === 'watch') {
     const release = lock(path.join(p.dir, 'watch.lock')), startedAt = Date.now();
     let stopped = false;
@@ -255,7 +371,8 @@ async function main(argv = process.argv.slice(2)) {
   throw new Error('无法识别命令，请运行 help 查看用法');
 }
 if (require.main === module) main().catch((e) => {
-  if (process.argv[2] === 'hook' || process.argv.includes('--quiet')) return;
+  if (process.argv[2] === 'hook') { process.stdout.write('{}\n'); return; }
+  if (process.argv.includes('--quiet')) return;
   console.error(e.message && !/ENOENT|EACCES|ENOSPC|fetch failed/.test(e.message) ? e.message : '操作未完成，请检查本机目录、网络与可用空间后重试');
   process.exitCode = 1;
 });

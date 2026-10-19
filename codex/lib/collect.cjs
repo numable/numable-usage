@@ -6,6 +6,7 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const zlib = require('node:zlib');
 const { spawn } = require('node:child_process');
+const { absorbLog } = require('./live.cjs');
 
 const VERSION = 1;
 const MODEL = /^[a-zA-Z0-9._-]{1,80}$/;
@@ -87,6 +88,7 @@ function processRow(file, row, salt, options = {}) {
   file.lastAt = Math.max(file.lastAt, at);
   const turn = typeof p.turn_id === 'string' ? hash(salt, `turn:${p.turn_id}`) : file.turn;
   const base = { at, session: file.session, project: file.project, model: file.model, turn, subagent: file.subagent };
+  if (options.live) absorbLog(file, row, { ...base, projectName: options.projects ? file.projectName : null }, (value) => hash(salt, value));
   if (row.type === 'token_usage_record') {
     const u = usage(p.usage);
     if (!u) { file.diagnostics.invalidUsage++; return; }
@@ -159,11 +161,11 @@ async function readFile(filePath, old, salt, options) {
   const head = crypto.createHash('sha256').update(first).digest('hex');
   const identity = `${stat.dev}:${stat.ino}`;
   // 小文件首段会随追加变化；只有旧文件已超过 256 字节才用首段判断替换。
-  const reset = !old || old.identity !== identity || old.offset > stat.size || old.offset >= 256 && old.head !== head || old.projectsEnabled !== (options.projects === true);
+  const reset = !old || old.identity !== identity || old.offset > stat.size || old.offset >= 256 && old.head !== head || old.projectsEnabled !== (options.projects === true) || old.liveEnabled !== (options.live === true) || old.profile !== options.profile;
   const f = reset ? projection() : structuredClone(old);
-  f.identity = identity; f.head = head; f.projectsEnabled = options.projects === true;
+  f.identity = identity; f.head = head; f.projectsEnabled = options.projects === true; f.liveEnabled = options.live === true; f.profile = options.profile;
   if (!reset && (compressed ? f.size === stat.size && f.mtime === stat.mtimeMs : f.offset === stat.size)) return { file: f, rows: 0 };
-  if (compressed && !reset) Object.assign(f, projection(), { identity, head, projectsEnabled: options.projects === true });
+  if (compressed && !reset) Object.assign(f, projection(), { identity, head, projectsEnabled: options.projects === true, liveEnabled: options.live === true, profile: options.profile });
   const start = compressed ? 0 : f.offset;
   if (!stat.size) return { file: f, rows: 0 };
   let stream, child, childDone;
@@ -203,10 +205,12 @@ async function collect(roots, previous = initialState(), options = {}) {
   const state = structuredClone(previous);
   const found = await discover(roots);
   const stats = { files: found.paths.length, scanned: 0, rows: 0, unreadableFiles: 0, ...found.skipped };
+  const profiles = roots.map((root) => ({ root: path.resolve(root), id: hash(state.salt, `profile:${path.resolve(root)}`) }));
   for (const p of found.paths) {
     const key = hash(state.salt, `file:${p}`);
     try {
-      const r = await readFile(p, state.files[key], state.salt, options);
+      const profile = profiles.filter((entry) => p.startsWith(entry.root + path.sep)).sort((a, b) => b.root.length - a.root.length)[0]?.id;
+      const r = await readFile(p, state.files[key], state.salt, { ...options, profile });
       state.files[key] = r.file; stats.rows += r.rows; stats.scanned += r.rows > 0 ? 1 : 0;
     } catch (e) {
       if (e.code === 'ENOENT' && p.endsWith('.zst')) stats.compressedUnavailable++;
@@ -214,7 +218,7 @@ async function collect(roots, previous = initialState(), options = {}) {
     }
   }
   // 旧文件被上游清理后仍保留数字历史；归档副本由响应身份去重。
-  return { state, stats, snapshot: summarize(state, options) };
+  return { state, stats, snapshot: summarize(state, { ...options, activeProfiles: profiles.map((p) => p.id) }) };
 }
 
 function summarize(state, options = {}) {
@@ -240,7 +244,10 @@ function summarize(state, options = {}) {
     for (const [key, r] of Object.entries(f.prompts)) if (!prompts.has(key) || r.at < prompts.get(key).at) prompts.set(key, r);
     for (const minute of Object.keys(f.activity)) activity.add(Number(minute));
     if (f.project) projects.set(f.project, options.projects ? f.projectName : null);
-    for (const q of Object.values(f.quotas)) if (!quotas.has(q.id) || q.observedAt > quotas.get(q.id).observedAt) quotas.set(q.id, q);
+    if (!options.activeProfiles || options.activeProfiles.includes(f.profile)) for (const q of Object.values(f.quotas)) {
+      const key = `${f.profile || 'default'}:${q.id}`;
+      if (!quotas.has(key) || q.observedAt > quotas.get(key).observedAt) quotas.set(key, { ...q, profile: f.profile || null });
+    }
   }
   const events = [...records.values()];
   for (const r of legacy.values()) {

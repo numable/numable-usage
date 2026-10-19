@@ -39,6 +39,7 @@ function sanitizeTurn(t) {
   if (!s) return null;
   const long = Array.isArray(t.long) && CATS.includes(t.long[0]) ? [t.long[0], int(t.long[1], 864e5)] : null;
   return {
+    ...(typeof t.id === 'string' && /^[a-f0-9]{8,16}$/.test(t.id) ? { id: t.id } : {}),
     n: int(t.n, 1e6), s, e: intOrNull(t.e), perm: int(t.perm, 864e5), tools: int(t.tools, 1e6),
     seq: typeof t.seq === 'string' && SEQ_RE.test(t.seq) ? t.seq : '',
     cells: typeof t.cells === 'string' && CELLS_RE.test(t.cells) ? t.cells : '',
@@ -59,6 +60,9 @@ function sanitizeSession(x, tier) {
     model: typeof x.model === 'string' && MODEL_RE.test(x.model) ? x.model : null,
     tools: int(x.tools, 1e7), errors: int(x.errors, 1e7), compactions: int(x.compactions, 1e4), fs: int(x.fs, 1e5),
     turns: (Array.isArray(x.turns) ? x.turns.slice(-MAX_TURNS) : []).map(sanitizeTurn).filter(Boolean),
+    ...(int(x.clippedTurns, 1e6) ? { clippedTurns: int(x.clippedTurns, 1e6) } : {}),
+    ...(['active', 'paused', 'blocked', 'usageLimited', 'budgetLimited', 'complete'].includes(x.goalStatus)
+      ? { goalStatus: x.goalStatus, goalCompleteAt: x.goalStatus === 'complete' ? intOrNull(x.goalCompleteAt) : null } : {}),
     subs: (Array.isArray(x.subs) ? x.subs.slice(-30) : [])
       .filter((s) => Array.isArray(s)).map((s) => [int(s[0]), int(s[1]), int(s[2], 1e6)]).filter((s) => s[0] > 0),
   };
@@ -73,16 +77,17 @@ export function sanitizeLive(body) {
   const tier = oneOf(body.tier, [1, 2, 3], 1);
   const sessions = (Array.isArray(body.sessions) ? body.sessions.slice(0, MAX_SESSIONS) : [])
     .map((x) => sanitizeSession(x, tier)).filter(Boolean);
-  return { tier, devNow: int(body.devNow), sessions };
+  return { tier, devNow: int(body.devNow), sessions,
+    ...(Number.isSafeInteger(body.seq) && body.seq > 0 ? { seq: body.seq } : {}) };
 }
 
-const SHIFT_KEYS = ['changedAt', 'startAt', 'lastAt', 'beatAt', 'endAt', 'permSince'];
+const SHIFT_KEYS = ['changedAt', 'startAt', 'lastAt', 'beatAt', 'endAt', 'permSince', 'goalCompleteAt'];
 /** 把一台设备的时间戳校到服务端时钟 */
 function shift(sess, skew) {
   if (!skew) return sess;
   const m = (v) => (v ? v + skew : v);
   const r = { ...sess };
-  for (const k of SHIFT_KEYS) r[k] = m(r[k]);
+  for (const k of SHIFT_KEYS) if (k in r) r[k] = m(r[k]);
   r.turns = r.turns.map((t) => ({ ...t, s: m(t.s), e: m(t.e) }));
   r.subs = r.subs.map((s) => [m(s[0]), m(s[1]), s[2]]);
   return r;
@@ -123,7 +128,7 @@ export function mergeLive(rows, now) {
   const devices = [];
   for (const [dev, row] of Object.entries(rows)) {
     if (!row || now - row.at > KEEP_MS) continue;
-    devices.push({ dev, at: row.at, tier: row.tier });
+    devices.push({ dev, at: row.at, tier: row.tier, ...(row.seq ? { seq: row.seq } : {}) });
     for (const s0 of row.sessions) {
       const s = shift(s0, row.skew);
       if ((s.state === 'ended' || s.state === 'lost') && now - (s.endAt || s.changedAt) > KEEP_MS) continue;
@@ -165,7 +170,7 @@ function projLabels(merged) {
  * - done:一轮实跑 ≥ long 分钟、跑完仍在等你,且**跑完在订阅之后**(不翻旧账)
  * - stuck:服务端判出可能卡住
  */
-export function pushEvents(merged, opts, createdAt = 0) {
+export function pushEvents(merged, opts, createdAt = 0, source = 'claude-code') {
   const now = merged.now, en = String(opts.lang || '').startsWith('en');
   const perm = Number.isFinite(opts.perm) ? opts.perm : 3, long = Number.isFinite(opts.long) ? opts.long : 10;
   const label = projLabels(merged);
@@ -175,7 +180,7 @@ export function pushEvents(merged, opts, createdAt = 0) {
     const path = `/session?sid=${s.sid}&dev=${s.dev}`;
     if (opts.wait !== false && s.state === 'perm') {
       const since = s.permSince || s.changedAt, m = Math.floor((now - since) / 60e3);
-      if (now - since >= perm * 60e3) out.push({ key: `w:${s.dev}:${s.sid}:${since}`, kind: 'wait', level: 'urgent', path, collapse: `w-${s.sid}`,
+      if (now - since >= perm * 60e3) out.push({ key: `w:${s.dev}:${s.sid}:${since}`, kind: 'wait', level: source === 'codex' ? 'normal' : 'urgent', path, collapse: `w-${s.sid}`,
         title: en ? `${name} needs your approval` : `${name} 在等你授权`, body: en ? `Waiting ${Math.max(1, m)} min` : `已经等了 ${Math.max(1, m)} 分钟` });
     }
     const t = s.turns[s.turns.length - 1];
@@ -183,13 +188,18 @@ export function pushEvents(merged, opts, createdAt = 0) {
       const run = t.e - t.s - t.perm;
       if (run >= long * 60e3) {
         const m = Math.round(run / 60e3);
-        out.push({ key: `d:${s.dev}:${s.sid}:${t.n}`, kind: 'done', level: 'normal', path, collapse: `d-${s.sid}`,
-          title: en ? `${name} finished a long task` : `${name} 的长任务跑完了`, body: en ? `Ran ${m} min · your turn` : `跑了 ${m} 分钟，等你接着说` });
+        out.push({ key: `d:${s.dev}:${s.sid}:${t.id || t.n}`, kind: 'done', level: 'normal', path, collapse: `d-${s.sid}`,
+          title: source === 'codex' ? en ? `${name} finished a long turn` : `${name} 的长轮次已结束` : en ? `${name} finished a long task` : `${name} 的长任务跑完了`,
+          body: en ? `Ran ${m} min · your turn` : `跑了 ${m} 分钟，等你接着说` });
       }
+    }
+    if (source === 'codex' && opts.goal === true && s.goalStatus === 'complete' && s.goalCompleteAt > createdAt) {
+      out.push({ key: `g:${s.dev}:${s.sid}:${s.goalCompleteAt}`, kind: 'goal', level: 'normal', path, collapse: `g-${s.sid}`,
+        title: en ? `${name} completed its goal` : `${name} 的目标已完成`, body: en ? 'Codex explicitly marked the goal complete.' : 'Codex 已明确标记目标完成。' });
     }
     if (opts.stuck !== false && s.stuck) {
       const w = stuckWhy(s.stuck);
-      out.push({ key: `s:${s.dev}:${s.sid}:${s.stuck.k}:${t ? t.n : 0}`, kind: 'stuck', level: 'normal', path, collapse: `s-${s.sid}`,
+      out.push({ key: `s:${s.dev}:${s.sid}:${s.stuck.k}:${t ? t.id || t.n : 0}`, kind: 'stuck', level: 'normal', path, collapse: `s-${s.sid}`,
         title: en ? `${name} may be stuck` : `${name} 可能卡住了`, body: en ? w[1] : w[0] });
     }
   }
@@ -236,7 +246,7 @@ export class LiveSpace {
     let dirty = false;
     for (const id of ids) {
       const sub = subs[id];
-      for (const ev of pushEvents(merged, sub.opts, sub.createdAt)) {
+      for (const ev of pushEvents(merged, sub.opts, sub.createdAt, this.source)) {
         if (sub.sent.includes(ev.key)) continue;
         let status = 0;
         try {
@@ -267,6 +277,7 @@ export class LiveSpace {
   }
 
   async load() {
+    if (this.source === undefined) this.source = (await this.ctx.storage.get('source')) || 'claude-code';
     if (this.rows) return this.rows;
     const all = await this.ctx.storage.list({ prefix: 'dev:' });
     this.rows = {};
@@ -278,6 +289,9 @@ export class LiveSpace {
     const url = new URL(req.url);
     const now = Date.now();
     const rows = await this.load();
+    if (url.searchParams.get('source') === 'codex' && this.source !== 'codex') {
+      this.source = 'codex'; await this.ctx.storage.put('source', 'codex');
+    }
 
     // 手机登记 / 取消服务器通知(读令牌鉴权,worker 已验):{ id, on, handle?, perm?, long?, wait?, done?, stuck?, lang? }
     if (req.method === 'POST' && url.pathname === '/notify') {
@@ -292,7 +306,7 @@ export class LiveSpace {
       const prev = subs[id];
       subs[id] = {
         handle: b.handle, createdAt: prev && prev.handle === b.handle ? prev.createdAt : now, sent: prev ? prev.sent : [], lastSentAt: prev ? prev.lastSentAt || 0 : 0,
-        opts: { perm: num(b.perm, 3, 0, 240), long: num(b.long, 10, 1, 600), wait: b.wait !== false, done: b.done !== false, stuck: b.stuck !== false,
+        opts: { perm: num(b.perm, 3, 0, 240), long: num(b.long, 10, 1, 600), wait: b.wait !== false, done: b.done !== false, stuck: b.stuck !== false, goal: b.goal === true,
           lang: typeof b.lang === 'string' && /^[a-z]{2}(-[A-Za-z]{2,4})?$/.test(b.lang) ? b.lang : 'zh-CN' },
       };
       await this.ctx.storage.put('subs', subs);
@@ -319,10 +333,12 @@ export class LiveSpace {
       let body; try { body = await req.json(); } catch { return Response.json({ error: 'bad_json' }, { status: 400 }); }
       const clean = sanitizeLive(body);
       if (!clean) return Response.json({ error: 'bad_payload' }, { status: 400 });
+      if (rows[dev]?.seq && (!clean.seq || clean.seq <= rows[dev].seq)) return Response.json({ ok: true, ignored: true });
       if (!rows[dev] && Object.keys(rows).length >= MAX_DEVICES) return Response.json({ error: 'too_many_devices' }, { status: 409 });
       // 偏差超过一天视为设备时钟坏了,不校(校了反而把时间轴整个挪走)
       const skew = clean.devNow && Math.abs(now - clean.devNow) < 864e5 ? now - clean.devNow : 0;
-      const row = { at: now, skew: Math.abs(skew) < 1500 ? 0 : skew, tier: clean.tier, sessions: clean.sessions };
+      const row = { at: now, skew: Math.abs(skew) < 1500 ? 0 : skew, tier: clean.tier, sessions: clean.sessions,
+        ...(clean.seq ? { seq: clean.seq } : {}) };
       rows[dev] = row;
       await this.ctx.storage.put('dev:' + dev, row);
       const due = await this.notify(now);
@@ -347,7 +363,7 @@ export class LiveSpace {
         // 时区:取数流把「看的人那台设备此刻的时分」(lt=HHmm)与 ms 一起带来,这里反推 UTC 偏移 ——
         // 取数流里做不了可靠的时区算术,而组件上要写本地时刻(「15:36 起」「截至 15:42」)
         const tzo = Number.isFinite(n('tzo')) && url.searchParams.has('tzo') ? n('tzo') : tzoOf(url.searchParams.get('lt'), n('ms'));
-        return Response.json({ updatedAt: merged.updatedAt, w: widgetView(merged, { win: n('win'), tzo, rows: n('rows') || 8, lanes: n('lanes') || 10 }) },
+        return Response.json({ updatedAt: merged.updatedAt, w: widgetView(merged, { win: n('win'), tzo, rows: n('rows') || 8, lanes: n('lanes') || 10, source: url.searchParams.get('source') }) },
           { headers: { 'cache-control': 'no-store' } });
       }
       if (this.req === undefined) this.req = (await this.ctx.storage.get('req')) || 0;
@@ -446,13 +462,21 @@ export function widgetView(merged, opts = {}) {
   }
 
   const row = (s) => {
-    const st = ST[s.state] || ST.input;
+    let st = ST[s.state] || ST.input;
+    if (opts.source === 'codex' && s.state === 'running') st = { ...st, c: '#0D9488|#54D3C2' };
+    const outcome = s.turns.at(-1)?.end;
+    if (opts.source === 'codex' && s.state === 'lost') st = { ...st, z: '状态待确认', e: 'Status unconfirmed' };
+    if (opts.source === 'codex' && s.state === 'input' && outcome === 'error') st = { ...st, z: '上轮失败 · 等你输入', e: 'Last turn failed · your turn' };
+    if (opts.source === 'codex' && s.state === 'input' && outcome === 'interrupt') st = { ...st, z: '已中断 · 等你输入', e: 'Interrupted · your turn' };
     const since = sinceOf(s);
     const p = projLabel[s.proj || 'none'];
     const dz = DOING[lastCat(s)] || DOING.o;
     let tz, te;
     if (s.stuck) { const w = stuckWhy(s.stuck); tz = `可能卡住 · ${w[0]}`; te = `May be stuck · ${w[1]}`; }
-    else if (s.state === 'running') { tz = s.title || `正在${dz[0]}`; te = s.title || dz[1]; }
+    else if (s.state === 'running') {
+      tz = s.title || (opts.source === 'codex' ? `运行中 · 最近${dz[0]}` : `正在${dz[0]}`);
+      te = s.title || (opts.source === 'codex' ? `Running · ${dz[1]}` : dz[1]);
+    }
     else if (s.state === 'perm' || s.state === 'input') { tz = `${st.z} · ${hhmm(since, tzo)} 起`; te = `${st.e} · since ${hhmm(since, tzo)}`; }
     else { tz = s.title ? `${st.z} · ${s.title}` : st.z; te = s.title ? `${st.e} · ${s.title}` : st.e; }
     return {
@@ -553,7 +577,7 @@ export function alertView(merged, opts = {}) {
     if (!label[k]) { const L = LETTERS[li++ % 26]; label[k] = s.pname ? { z: s.pname, e: s.pname } : { z: `项目 ${L}`, e: `Project ${L}` }; }
   }
   const out = { wait: 0, waitKey: '', wProjZ: '', wProjE: '', wMins: '', wN: 0, done: 0, doneKey: '', dProjZ: '', dProjE: '', dMins: '',
-    stuck: 0, stuckKey: '', sProjZ: '', sProjE: '', sWhyZ: '', sWhyE: '' };
+    stuck: 0, stuckKey: '', sProjZ: '', sProjE: '', sWhyZ: '', sWhyE: '', goalKey: '', gProjZ: '', gProjE: '' };
 
   const waiting = merged.sessions
     .filter((s) => s.state === 'perm' && (s.permSince || s.changedAt) && now - (s.permSince || s.changedAt) >= permMin * 60e3)
@@ -570,14 +594,19 @@ export function alertView(merged, opts = {}) {
     .sort((a, b) => b.t.e - a.t.e);
   if (done.length) {
     const { s, t } = done[0];
-    Object.assign(out, { done: 1, doneKey: `${s.dev}:${s.sid}:${t.n}`, dProjZ: label[s.proj || 'none'].z, dProjE: label[s.proj || 'none'].e,
+    Object.assign(out, { done: 1, doneKey: `${s.dev}:${s.sid}:${t.id || t.n}`, dProjZ: label[s.proj || 'none'].z, dProjE: label[s.proj || 'none'].e,
       dMins: String(Math.max(1, Math.round((t.e - t.s - t.perm) / 60e3))) });
+  }
+  const completeGoals = merged.sessions.filter((s) => s.goalStatus === 'complete' && s.goalCompleteAt).sort((a, b) => b.goalCompleteAt - a.goalCompleteAt);
+  if (completeGoals.length) {
+    const s = completeGoals[0];
+    Object.assign(out, { goalKey: `${s.dev}:${s.sid}:${s.goalCompleteAt}`, gProjZ: label[s.proj || 'none'].z, gProjE: label[s.proj || 'none'].e });
   }
   // 可能卡住:取最早开始的那一路;键 = 设备:会话:原因:轮号 —— 同一轮同一种原因只响一次,换了原因(比如先失败后转圈)会再响
   const stuck = merged.sessions.filter((s) => s.stuck).sort((a, b) => a.startAt - b.startAt);
   if (stuck.length) {
     const s = stuck[0], t = s.turns[s.turns.length - 1], w = stuckWhy(s.stuck);
-    Object.assign(out, { stuck: 1, stuckKey: `${s.dev}:${s.sid}:${s.stuck.k}:${t ? t.n : 0}`, sProjZ: label[s.proj || 'none'].z, sProjE: label[s.proj || 'none'].e, sWhyZ: w[0], sWhyE: w[1] });
+    Object.assign(out, { stuck: 1, stuckKey: `${s.dev}:${s.sid}:${s.stuck.k}:${t ? t.id || t.n : 0}`, sProjZ: label[s.proj || 'none'].z, sProjE: label[s.proj || 'none'].e, sWhyZ: w[0], sWhyE: w[1] });
   }
   return out;
 }

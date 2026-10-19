@@ -56,6 +56,7 @@ export function sanitizeCodex(raw, now = Date.now()) {
     const primary = cleanWindow(q.primary), secondary = cleanWindow(q.secondary);
     if (!primary && !secondary) continue;
     quotas.push({ id: q.id, account: typeof q.account === 'string' && HASH.test(q.account) ? q.account : null,
+      profile: typeof q.profile === 'string' && HASH.test(q.profile) ? q.profile : null,
       origin: q.origin === 'rpc' ? 'rpc' : 'log', observedAt: q.observedAt, primary, secondary });
   }
   const coverage = (Array.isArray(raw.coverage) ? raw.coverage : []).slice(0, 32).map((c) => ({
@@ -65,11 +66,12 @@ export function sanitizeCodex(raw, now = Date.now()) {
   }));
   return { v: 1, collectedAt: raw.collectedAt, timezone, privacy: { projects: projectsEnabled },
     sessionCount: n(raw.sessionCount),
+    quotaDiagnostics: { failures: n(raw.quotaDiagnostics?.failures) ?? 0, profiles: n(raw.quotaDiagnostics?.profiles) ?? 0 },
     days: [...days.values()].sort((a, b) => a.date.localeCompare(b.date)), quotas, coverage,
     diagnostics: counters(raw.diagnostics, DIAGNOSTICS), collection: counters(raw.collection, COLLECTION) };
 }
 
-export function mergeCodex(rows, anchor = '', now = Date.now()) {
+export function mergeCodex(rows, anchor = '', now = Date.now(), options = {}) {
   const today = validDate(anchor) ? anchor : new Date(now).toISOString().slice(0, 10);
   const days = new Map(), quotas = new Map(), devices = [], timezones = new Set();
   const diagnostics = Object.fromEntries(DIAGNOSTICS.map((k) => [k, 0]));
@@ -92,7 +94,7 @@ export function mergeCodex(rows, anchor = '', now = Date.now()) {
       }
     }
     for (const q of row.quotas || []) {
-      const key = `${q.account || `device:${row.device}`}:${q.id}`;
+      const key = `${q.account || `device:${row.device}:${q.profile || 'default'}`}:${q.id}`;
       // 已知账号取最新观测；未知账号保留设备维度，不能猜测同账号。
       if (!quotas.has(key) || q.observedAt > quotas.get(key).observedAt) quotas.set(key, { ...q, device: row.device });
     }
@@ -139,17 +141,25 @@ export function mergeCodex(rows, anchor = '', now = Date.now()) {
   const mainQuota = allQuotas.find((q) => q.id === 'codex') || allQuotas[0];
   const mainWindow = mainQuota?.primary || mainQuota?.secondary;
   const quotaValid = !!mainWindow && mainWindow.resetsAt * 1000 > now;
+  const threshold = Number.isFinite(options.quotaThreshold) ? Math.max(0, Math.min(100, options.quotaThreshold)) : 20;
+  const low = allQuotas.flatMap((q) => ['primary', 'secondary'].map((which) => ({ q, w: q[which], which })))
+    .filter(({ q, w }) => w && w.resetsAt * 1000 > now && now >= q.observedAt && now - q.observedAt <= 15 * 60000 && 100 - w.usedPercent <= threshold)
+    .sort((a, b) => a.w.resetsAt - b.w.resetsAt || b.w.usedPercent - a.w.usedPercent)[0];
+  const quotaAlert = low ? { key: `${low.q.account || low.q.device + ':' + (low.q.profile || 'default')}:${low.q.id}:${low.which}:${low.w.resetsAt}:${threshold}`,
+    remaining: Math.max(0, 100 - low.w.usedPercent), resetsAt: low.w.resetsAt } : { key: '', remaining: null, resetsAt: null };
   let streak = 0;
   for (let i = days.get(today)?.total || days.get(today)?.turns ? 0 : 1; i < 400; i++) {
     const d = days.get(before(i)); if (!d || !(d.total || d.turns || d.prompts)) break; streak++;
   }
   return { now, todayDate: today, known, incomplete, timezones: [...timezones], mixedTimezones: timezones.size > 1,
+    quotaIncomplete: rows.some((r) => r.quotaDiagnostics?.failures > 0),
     receivedAt, collectedAt, totals, today: todayData, days: list,
     models: [...models.values()].sort((a, b) => b.total - a.total), projects: [...projects.values()].sort((a, b) => b.total - a.total), devices, diagnostics,
     quotas: [...quotas.values()].map((q) => ({ ...q,
       primary: q.primary && { ...q.primary, remainingPercent: Math.max(0, 100 - q.primary.usedPercent), expired: q.primary.resetsAt * 1000 <= now },
       secondary: q.secondary && { ...q.secondary, remainingPercent: Math.max(0, 100 - q.secondary.usedPercent), expired: q.secondary.resetsAt * 1000 <= now },
     })),
+    alerts: { quota: quotaAlert },
     display: { todayInput: fmt(todayData.input), todayOutput: fmt(todayData.output), todayTotal: fmt(todayData.total), total: fmt(totals.total) },
     widgets: { bars, heat: heatDays, streak, quota: { available: quotaValid ? 1 : 0,
       remaining: quotaValid ? Math.max(0, 100 - mainWindow.usedPercent) : null,

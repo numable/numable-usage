@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { readQuota } = require('../codex/lib/quota.cjs');
+const { readQuota, readQuotaHomes } = require('../codex/lib/quota.cjs');
 function fake(t, reply) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'numable-quota-rpc-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
@@ -30,4 +30,20 @@ test('空额度明确不支持，不伪装为满额', async (t) => {
 test('未登录、协议错误与缺失可执行文件明确失败', async (t) => {
   await assert.rejects(readQuota(fake(t, { id: 2, error: { code: -32000, message: 'secret error' } })), /登录/);
   await assert.rejects(readQuota({ binary: '/does/not/exist', salt: 's', timeoutMs: 1000 }), /无法启动/);
+});
+
+test('多目录额度部分失败保留原观测并隔离匿名目录，范围换绑不继承旧快照', async (t) => {
+  const options = fake(t, { id: 2, result: { accountId: 'same-account', rateLimits: { primary: { usedPercent: 30, windowDurationMins: 300, resetsAt: 1900000000 } } } });
+  const first = await readQuotaHomes({ ...options, homes: ['/tmp/profile-a', '/tmp/profile-b'], profileSalt: 'local-salt' });
+  assert.equal(first.quotas.length, 2); assert.equal(first.failures, 0);
+  assert.equal(first.quotas[0].account, first.quotas[1].account);
+  assert.notEqual(first.quotas[0].profile, first.quotas[1].profile);
+  const partialScript = path.join(path.dirname(options.prefixArgs[0]), 'partial.cjs');
+  fs.writeFileSync(partialScript, `if(process.env.CODEX_HOME.endsWith('profile-a'))process.exit(1);else require(${JSON.stringify(options.prefixArgs[0])});`);
+  const partial = await readQuotaHomes({ ...options, prefixArgs: [partialScript], homes: ['/tmp/profile-a', '/tmp/profile-b'], profileSalt: 'local-salt', previous: first });
+  assert.equal(partial.failures, 1); assert.equal(partial.quotas.length, 2);
+  assert.equal(partial.quotas[0].observedAt, first.quotas[0].observedAt);
+  const changed = await readQuotaHomes({ ...options, binary: '/not/installed', homes: ['/tmp/profile-a'], previous: first, salt: 'changed-space' });
+  assert.equal(changed.failures, 1); assert.deepEqual(changed.quotas, []);
+  assert.ok(!JSON.stringify(partial).includes('/tmp/profile'));
 });
