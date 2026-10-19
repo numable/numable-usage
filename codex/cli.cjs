@@ -84,7 +84,7 @@ const shellQuote = (s) => process.platform === 'win32' ? `"${s.replace(/"/g, '""
 function hookDefinitions(p) {
   const command = [process.execPath, __filename, 'hook', '--state-dir', p.dir].map(shellQuote).join(' ');
   return ['SessionStart', 'SessionEnd', 'Stop', 'UserPromptSubmit', 'PermissionRequest', 'PreToolUse', 'PostToolUse', 'PreCompact', 'SubagentStart', 'SubagentStop', 'Interrupt'].map((event) => ({ event,
-    group: { hooks: [{ type: 'command', command, ...(event === 'SessionEnd' ? {} : { async: true }), timeout: event === 'Interrupt' ? 3 : 10 }] } }));
+    group: { hooks: [{ type: 'command', command, ...(event === 'SessionEnd' ? {} : { async: true }), timeout: ['SessionEnd', 'Interrupt'].includes(event) ? 3 : 10 }] } }));
 }
 function installHooks(config, p) {
   const installed = [];
@@ -93,8 +93,11 @@ function installHooks(config, p) {
     if (doc.hooks && (typeof doc.hooks !== 'object' || Array.isArray(doc.hooks))) throw new Error('已有事件钩子的格式无效，未覆盖原配置');
     doc.hooks ||= {};
     for (const { event, group } of hookDefinitions(p)) {
-      const groups = doc.hooks[event] || [];
+      let groups = doc.hooks[event] || [];
       if (!Array.isArray(groups)) throw new Error('已有事件钩子的格式无效，未覆盖原配置');
+      // 升级仅替换上次安装记录中完整匹配的定义，用户修改过的定义保留。
+      const previous = (config.installed || []).filter((h) => h.file === file && h.event === event).map((h) => JSON.stringify(h.group));
+      groups = groups.filter((g) => !previous.includes(JSON.stringify(g)));
       const serialized = JSON.stringify(group);
       if (!groups.some((g) => JSON.stringify(g) === serialized)) groups.push(group);
       doc.hooks[event] = groups;

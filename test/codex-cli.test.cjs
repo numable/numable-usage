@@ -44,6 +44,25 @@ test('安装钩子幂等、卸载仅移除自己的钩子并保留用户原配�
   assert.equal(run('uninstall').status, 0);
   assert.deepEqual(JSON.parse(fs.readFileSync(path.join(home, 'hooks.json'))), original);
 });
+test('升级替换已记录的旧钩子，保留用户修改的副本并可完整卸载', (t) => {
+  const { home, state, run } = setup(t);
+  assert.equal(run('install').status, 0);
+  const file = path.join(home, 'hooks.json'), configFile = path.join(state, 'config.json');
+  const hooks = JSON.parse(fs.readFileSync(file)), config = JSON.parse(fs.readFileSync(configFile));
+  hooks.hooks.SessionEnd[0].hooks[0].timeout = 10;
+  config.installed.find((h) => h.event === 'SessionEnd').group.hooks[0].timeout = 10;
+  const custom = structuredClone(hooks.hooks.SessionEnd[0]);
+  custom.hooks[0].command = 'echo user-modified';
+  hooks.hooks.SessionEnd.push(custom);
+  fs.writeFileSync(file, JSON.stringify(hooks)); fs.writeFileSync(configFile, JSON.stringify(config));
+  assert.equal(run('install').status, 0);
+  const updated = JSON.parse(fs.readFileSync(file));
+  assert.equal(updated.hooks.SessionEnd.length, 2);
+  assert.deepEqual(updated.hooks.SessionEnd[0], custom);
+  assert.equal(updated.hooks.SessionEnd[1].hooks[0].timeout, 3);
+  assert.equal(run('uninstall').status, 0);
+  assert.deepEqual(JSON.parse(fs.readFileSync(file)).hooks, { SessionEnd: [custom] });
+});
 test('拒绝向非回环明文服务发送凭证，拒绝带用户信息的服务地址', () => {
   assert.throws(() => endpoint('http://example.com'), /HTTPS/);
   assert.throws(() => endpoint('https://secret@example.com'), /HTTPS/);
