@@ -74,6 +74,8 @@ node codex/cli.cjs uninstall
 
 安装保留已有钩子；升级时仅替换上次安装记录中完整匹配的本工具定义，用户修改过的定义保留。安装之后，需要在 Codex 中检查并信任新增定义才会执行；采集器不会绕过信任检查。卸载只移除完整匹配的本工具定义，保留本机历史并暂停同步。
 
+Windows 安装时，钩子通过系统 `powershell.exe -NoProfile -NonInteractive -EncodedCommand` 启动。编码载荷使用 UTF-16LE，内部以调用运算符和单引号字面量传递 Node、安装目录与状态目录，保留空格、中文及特殊字符；不修改 PowerShell 执行策略。升级后请在 Codex 重新审查发生变化的定义。
+
 事件钩子立即启动不持有原会话输入输出的后台采集进程。`watch` 可在终端保持运行，每 60 秒补偿扫描；`stop` 通过本工具的停止标记请求退出，不根据一个旧 PID 杀进程。
 
 `start` 在后台运行并确认进程取得采集锁，重复启动复用现有进程。实时默认关闭，`live-on` 开启，`live-off` 清除本机实时视图并在下次同步时清空服务端本设备实时视图；`live` 查看当前投影。钩子先脱敏入队，采集锁繁忙时继续排队，不等待采集完成。状态只由真实事件更新，无事件时不会通过扫描伪造心跳。
@@ -120,6 +122,14 @@ NUMABLE_CODEX_BINARY=/自己的/codex/可执行文件 node service/scripts/verif
 
 此脚本只核对真实协议清单、事件 / 超时 / 异步参数和未信任状态，不代替信任后的生命周期触发验收。定义升级后，Codex 会要求重新审查发生变化的钩子。
 
+Windows 主机可运行钩子命令验收：
+
+```sh
+node --test test/codex-hook-command.test.cjs test/codex-cli.test.cjs
+```
+
+Windows 上默认使用系统 Windows PowerShell，并额外经 cmd / PowerShell 两种外层 shell 执行生成命令。其他系统可通过 `NUMABLE_TEST_POWERSHELL` 指定已有 PowerShell 运行时，验证内部字面量、标准输入和退出码；这不能证明 Windows 外层 shell、npm `.cmd` 入口或原生 Codex 的事件触发已通过。
+
 ## 当前兼容证据
 
 | 范围 | 已有证据 | 尚未证明 |
@@ -128,6 +138,7 @@ NUMABLE_CODEX_BINARY=/自己的/codex/可执行文件 node service/scripts/verif
 | 历史版本 | 0.147.0-alpha.6.5、0.159.2、0.163.0-alpha.10.2 的现存日志可解析 | 这些版本完整启动、恢复、分叉与休眠流程 |
 | 额度 | 桌面端内置可执行文件的真实只读协议；多目录失败保留夹具 | 真实账号切换和 Windows 可执行文件发现 |
 | 安装包 | tgz 六文件、离线安装、带空格 / 中文 / 单引号路径、生成钩子命令实际执行、卸载保留历史 | Windows npm 命令入口及钩子执行环境 |
+| Windows 命令生成 | macOS 上官方 PowerShell 7.6.7 实际运行：复杂路径、Unicode 标准输入、0 / 23 退出码 | Windows PowerShell 5.1、cmd / PowerShell 外层、npm 命令入口与启动耗时 |
 | 生命周期钩子 | 官方字段核对、并发进程队列、原始正文不落盘、SessionEnd / Interrupt 三秒上限；真实 app-server 识别全部 11 条定义、未信任状态与卸载后清单为空 | 在 Codex 内经过真实信任流程后触发 |
 | 多设备 | 两份临时配置接真实本机服务的完整加入、合并、暂停恢复与删除 | 两台物理电脑及跨操作系统实操 |
 

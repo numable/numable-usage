@@ -80,9 +80,20 @@ async function request(config, route, body, token) {
     return await r.json();
   } finally { clearTimeout(timer); }
 }
-const shellQuote = (s) => process.platform === 'win32' ? `"${s.replace(/"/g, '""')}"` : `'${s.replace(/'/g, "'\\''")}'`;
+function hookCommand({ stateDir, node = process.execPath, cli = __filename, platform = process.platform }) {
+  const args = [node, cli, 'hook', '--state-dir', stateDir];
+  if (platform === 'win32') {
+    // 外层 cmd / PowerShell 都只解析固定程序名与 Base64，路径仅在内层按字面量传递。
+    // 不使用 Invoke-Expression，也不修改执行策略；调用运算符负责启动带空格的可执行路径。
+    const quote = (s) => `'${s.replace(/'/g, "''")}'`;
+    const script = `$ErrorActionPreference='Stop'; & ${args.map(quote).join(' ')}; exit $LASTEXITCODE`;
+    return `powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand ${Buffer.from(script, 'utf16le').toString('base64')}`;
+  }
+  const quote = (s) => `'${s.replace(/'/g, "'\\''")}'`;
+  return args.map(quote).join(' ');
+}
 function hookDefinitions(p) {
-  const command = [process.execPath, __filename, 'hook', '--state-dir', p.dir].map(shellQuote).join(' ');
+  const command = hookCommand({ stateDir: p.dir });
   return ['SessionStart', 'SessionEnd', 'Stop', 'UserPromptSubmit', 'PermissionRequest', 'PreToolUse', 'PostToolUse', 'PreCompact', 'SubagentStart', 'SubagentStop', 'Interrupt'].map((event) => ({ event,
     group: { hooks: [{ type: 'command', command, ...(event === 'SessionEnd' ? {} : { async: true }), timeout: ['SessionEnd', 'Interrupt'].includes(event) ? 3 : 10 }] } }));
 }
@@ -379,4 +390,4 @@ if (require.main === module) main().catch((e) => {
   console.error(e.message && !/ENOENT|EACCES|ENOSPC|fetch failed/.test(e.message) ? e.message : '操作未完成，请检查本机目录、网络与可用空间后重试');
   process.exitCode = 1;
 });
-module.exports = { parse, paths, endpoint, configFor, lock, installHooks, uninstallHooks, scan, request, main };
+module.exports = { parse, paths, endpoint, configFor, lock, installHooks, uninstallHooks, scan, request, main, hookCommand };
