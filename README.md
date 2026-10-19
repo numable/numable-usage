@@ -1,5 +1,7 @@
 # numable-usage
 
+Codex 用量采集器正在开发，包含本机统计、命令行、额度读取和可选手机同步。接入与验证方式见 [Codex 采集器说明](codex/README.md)。Codex 工具包尚未上线；下面仍是现有 Claude Code 工具的使用说明。
+
 把你的 **Claude Code 用量**做成手机与桌面小组件 —— 会话数、消息量、token 消耗、费用估算、5 小时窗口、活跃热力图、按模型 / 工具 / 项目分布。
 
 搭配 [Numable](https://get.numable.app)（iPhone · iPad · Mac · Android · HarmonyOS · Windows,应用商店即将上架）使用。

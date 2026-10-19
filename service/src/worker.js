@@ -19,6 +19,7 @@
  */
 
 import { LiveSpace, LIVE_MAX_BODY } from './live.js';
+import { sanitizeCodex, mergeCodex } from './codex.js';
 export { LiveSpace };
 
 const MAX_BODY = 256 * 1024;       // 单快照上限（v2 快照带逐日按模型 / 工具 / 小时明细，实测 90 天 ≈ 40KB）
@@ -229,7 +230,7 @@ function sanitizeClaudeCode(s) {
   };
 }
 
-const SOURCES = { 'claude-code': sanitizeClaudeCode };   // 枚举，不是自由字段
+const SOURCES = { 'claude-code': sanitizeClaudeCode, codex: sanitizeCodex };   // 枚举，不是自由字段
 
 // ─────────────────────────── API 标价 ───────────────────────────
 /*
@@ -978,7 +979,7 @@ async function handle(req, env, ctx) {
     if (raw.length > MAX_BODY) return err('payload_too_large', 413);
     let body; try { body = JSON.parse(raw); } catch { return err('bad_json'); }
 
-    const fn = SOURCES[body && body.source];
+    const fn = body && Object.hasOwn(SOURCES, body.source) ? SOURCES[body.source] : null;
     if (!fn) return err('unknown_source');
     const clean = fn(body.snapshot);
     if (!clean) return err('bad_snapshot');
@@ -997,7 +998,9 @@ async function handle(req, env, ctx) {
     await env.DB.batch([
       env.DB.prepare(
         `INSERT INTO snapshots(space_id, source, device, payload, updated_at) VALUES(?1,?2,?3,?4,?5)
-         ON CONFLICT(space_id, source, device) DO UPDATE SET payload=?4, updated_at=?5`
+         ON CONFLICT(space_id, source, device) DO UPDATE SET payload=?4, updated_at=?5
+         WHERE excluded.source <> 'codex'
+            OR json_extract(excluded.payload, '$.collectedAt') > COALESCE(json_extract(snapshots.payload, '$.collectedAt'), 0)`
       ).bind(space.space_id, body.source, device, JSON.stringify(clean), now),
       env.DB.prepare('UPDATE spaces SET last_push_at = ?2 WHERE space_id = ?1')
         .bind(space.space_id, now),
@@ -1015,7 +1018,7 @@ async function handle(req, env, ctx) {
     if (!spaceId) return err('unauthorized', 401);
     if (!(await allow(env, `fg:${spaceId}`, 10))) return err('rate_limited', 429);
     let body; try { body = await req.json(); } catch { return err('bad_json'); }
-    if (!body || !SOURCES[body.source]) return err('unknown_source');
+    if (!body || !Object.hasOwn(SOURCES, body.source)) return err('unknown_source');
     const device = body.device;
     if (typeof device !== 'string' || !(/^[a-f0-9]{4,32}$/.test(device) || device === 'default')) {
       return err('bad_device');
@@ -1057,13 +1060,15 @@ async function handle(req, env, ctx) {
   if (p === '/s' && req.method === 'GET') {
     const spaceId = await verifyToken(env, 'r', bearer(req));
     if (!spaceId) return err('unauthorized', 401);
+    const selectedSource = url.searchParams.get('source') || 'claude-code';
+    if (!Object.hasOwn(SOURCES, selectedSource)) return err('unknown_source');
     const rows = await env.DB.prepare(
       'SELECT source, device, payload, updated_at FROM snapshots WHERE space_id = ?1'
     ).bind(spaceId).all();
     const sources = {};
     let updatedAt = 0;
     for (const r of (rows.results || [])) {
-      updatedAt = Math.max(updatedAt, r.updated_at || 0);
+      if (r.source === selectedSource) updatedAt = Math.max(updatedAt, r.updated_at || 0);
       let pl = null; try { pl = JSON.parse(r.payload); } catch { continue; }
       (sources[r.source] || (sources[r.source] = [])).push({ device: r.device, updatedAt: r.updated_at, ...pl });
     }
@@ -1071,7 +1076,7 @@ async function handle(req, env, ctx) {
     // ?today= 只在离服务器时间 3 天以内才认 —— 各时区的「今天」都落在这个窗里，再远就是参数写错了
     const q = url.searchParams.get('today') || '';
     const anchor = DATE_RE.test(q) && Math.abs(Date.parse(q + 'T12:00:00Z') - Date.now()) < 3 * 864e5 ? q : '';
-    const merged = mergeClaudeCode(sources['claude-code'] || [], anchor);
+    const merged = selectedSource === 'codex' ? mergeCodex(sources.codex || [], anchor) : mergeClaudeCode(sources['claude-code'] || [], anchor);
     // ?lite=1：只要合并视图（组件 / 页面用）；各设备原样快照只有 --devices 这类工具才要
     return json(url.searchParams.get('lite') === '1' ? { updatedAt, merged } : { updatedAt, merged, sources });
   }
@@ -1084,7 +1089,9 @@ async function handle(req, env, ctx) {
     const spaceId = await verifyToken(env, 'r', bearer(req));
     if (!spaceId) return err('unauthorized', 401);
     if (!(await allow(env, `ntf:${spaceId}`, 20))) return err('rate_limited', 429);
-    const stub = env.LIVE.get(env.LIVE.idFromName(spaceId));
+    const source = url.searchParams.get('source') || 'claude-code';
+    if (!Object.hasOwn(SOURCES, source)) return err('unknown_source');
+    const stub = env.LIVE.get(env.LIVE.idFromName(source === 'claude-code' ? spaceId : `${spaceId}:${source}`));
     if (req.method === 'GET') return stub.fetch('https://live/notify' + url.search);
     const raw = await req.text();
     if (raw.length > 4096) return err('payload_too_large', 413);
@@ -1112,7 +1119,9 @@ async function handle(req, env, ctx) {
     const kind = req.method === 'POST' ? 'w' : 'r';
     const spaceId = await verifyToken(env, kind, bearer(req));
     if (!spaceId) return err('unauthorized', 401);
-    const stub = env.LIVE.get(env.LIVE.idFromName(spaceId));
+    const source = url.searchParams.get('source') || 'claude-code';
+    if (!Object.hasOwn(SOURCES, source)) return err('unknown_source');
+    const stub = env.LIVE.get(env.LIVE.idFromName(source === 'claude-code' ? spaceId : `${spaceId}:${source}`));
     if (req.method === 'GET') return stub.fetch('https://live/' + url.search);
     const dev = url.searchParams.get('dev') || '';
     if (!/^[a-f0-9]{4,32}$/.test(dev)) return err('bad_device');

@@ -1,0 +1,33 @@
+'use strict';
+const { test } = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const { readQuota } = require('../codex/lib/quota.cjs');
+function fake(t, reply) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'numable-quota-rpc-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const file = path.join(dir, 'fake.cjs');
+  fs.writeFileSync(file, `const rl=require('node:readline').createInterface({input:process.stdin});rl.on('line',line=>{const r=JSON.parse(line);if(r.method==='initialize') console.log(JSON.stringify({id:1,result:{}}));if(r.id===2)console.log(JSON.stringify(${JSON.stringify(reply)}));});`);
+  return { binary: process.execPath, prefixArgs: [file], salt: 'same-space-secret', timeoutMs: 2000 };
+}
+test('额度读取只保留数字窗口与匿名账号，支持多桶和可空窗口', async (t) => {
+  const options = fake(t, { id: 2, result: { accountId: 'raw-private-account', email: 'never@send.test', rateLimitsByLimitId: {
+    codex: { primary: { usedPercent: 25, windowDurationMins: 300, resetsAt: 1900000000 }, secondary: null },
+    extra: { primary: null, secondary: { usedPercent: 50, windowDurationMins: 10080, resetsAt: 1900000000 } },
+  } } });
+  const a = await readQuota(options), b = await readQuota(options);
+  assert.equal(a.quotas.length, 2); assert.equal(a.quotas[0].account, b.quotas[0].account);
+  assert.ok(!JSON.stringify(a).includes('raw-private') && !JSON.stringify(a).includes('never@'));
+  const c = await readQuota({ ...options, salt: 'different-space' });
+  assert.notEqual(a.quotas[0].account, c.quotas[0].account);
+});
+test('空额度明确不支持，不伪装为满额', async (t) => {
+  const r = await readQuota(fake(t, { id: 2, result: { rateLimits: null } }));
+  assert.equal(r.supported, false); assert.deepEqual(r.quotas, []);
+});
+test('未登录、协议错误与缺失可执行文件明确失败', async (t) => {
+  await assert.rejects(readQuota(fake(t, { id: 2, error: { code: -32000, message: 'secret error' } })), /登录/);
+  await assert.rejects(readQuota({ binary: '/does/not/exist', salt: 's', timeoutMs: 1000 }), /无法启动/);
+});

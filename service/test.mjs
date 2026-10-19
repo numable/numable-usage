@@ -48,7 +48,8 @@ ok(read1.s === 200, 'readToken 可读');
 ok(!blob.includes('secret') && !blob.includes('/Users/'), '✦ cwd / secretField 未落库');
 ok(!blob.includes('gitBranch') && !blob.includes('feature/x'), '✦ gitBranch 未落库');
 ok(!blob.includes('conversation') && !blob.includes('hello world'), '✦ 对话内容未落库');
-ok(!blob.includes('costUSD') && !blob.includes('42'), '✦ costUSD 未落库');
+// 时间戳也可能含 42；必须检查字段本身，不能靠任意数字子串判泄漏。
+ok(!blob.includes('"costUSD":') && Object.values(read1.j.sources['claude-code'][0].byModel).every((m) => !Object.hasOwn(m, 'costUSD')), '✦ costUSD 未落库');
 ok(!blob.includes('DROP TABLE'), '✦ 注入串未落库');
 const d0 = read1.j.sources['claude-code'][0];
 ok(d0.days[0].date === '2026-08-20' && d0.days[0].msgs === 10, '白名单数字字段保留');
