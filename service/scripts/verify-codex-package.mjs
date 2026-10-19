@@ -8,6 +8,11 @@ import { spawnSync, spawn } from 'node:child_process';
 
 if (process.platform === 'win32') throw new Error('本验收脚本使用 POSIX 安装前缀；Windows 需运行单独的原生验收');
 const source = fileURLToPath(new URL('../../codex/', import.meta.url));
+const args = process.argv.slice(2);
+if (args.length && (args.length !== 2 || args[0] !== '--archive')) {
+  throw new Error('用法：verify-codex-package.mjs [--archive 本机归档路径]');
+}
+const suppliedArchive = args.length ? fs.realpathSync(path.resolve(args[1])) : null;
 const temp = fs.mkdtempSync(path.join(os.tmpdir(), "codex 安装验收 ' "));
 const env = { ...process.env, PATH: path.dirname(process.execPath) + path.delimiter + process.env.PATH };
 const command = (binary, args, options = {}) => {
@@ -20,10 +25,17 @@ const waitUntil = async (check) => {
   while (!check()) { if (Date.now() - started > 10000) throw new Error('后台钩子处理超时'); await new Promise((r) => setTimeout(r, 50)); }
 };
 try {
-  const pack = JSON.parse(command('npm', ['pack', source, '--json', '--pack-destination', temp]));
-  assert.deepEqual(pack[0].files.map((f) => f.path).sort(), ['README.md', 'cli.cjs', 'lib/collect.cjs', 'lib/live.cjs', 'lib/quota.cjs', 'package.json']);
+  const archive = suppliedArchive || path.join(temp, JSON.parse(command('npm', ['pack', source, '--json', '--pack-destination', temp]))[0].filename);
+  const expected = ['README.md', 'cli.cjs', 'lib/collect.cjs', 'lib/live.cjs', 'lib/quota.cjs', 'package.json'];
+  const entries = command('tar', ['-tzf', archive]).split('\n');
+  assert.deepEqual(entries.sort(), expected.map((name) => 'package/' + name).sort());
+  for (const name of expected) {
+    const file = spawnSync('tar', ['-xOf', archive, 'package/' + name], { env });
+    assert.equal(file.status, 0, '读取候选文件失败');
+    assert.deepEqual(file.stdout, fs.readFileSync(path.join(source, name)), `候选归档与当前源码不同：${name}`);
+  }
   const prefix = path.join(temp, 'installed');
-  command('npm', ['install', '--global', '--prefix', prefix, '--offline', '--ignore-scripts', '--no-audit', '--no-fund', path.join(temp, pack[0].filename)]);
+  command('npm', ['install', '--global', '--prefix', prefix, '--offline', '--ignore-scripts', '--no-audit', '--no-fund', archive]);
   const bin = path.join(prefix, 'bin/numable-codex'), state = path.join(temp, '状态 with space'), home = path.join(temp, 'Codex home');
   fs.mkdirSync(path.join(home, 'sessions'), { recursive: true });
   const timestamp = new Date().toISOString();

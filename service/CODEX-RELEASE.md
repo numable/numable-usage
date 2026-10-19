@@ -26,6 +26,8 @@
 ```sh
 node --test test/*.test.cjs
 node service/scripts/verify-codex-package.mjs
+# 核对并安装将要交付的同一份归档，逐文件要求等于当前源码
+node service/scripts/verify-codex-package.mjs --archive /候选目录/numable-codex-usage-0.1.0.tgz
 NUMABLE_CODEX_BINARY=/自己的/Codex可执行文件 node service/scripts/verify-codex-hook-runtime.mjs
 ```
 
