@@ -327,7 +327,7 @@ async function main(argv = process.argv.slice(2)) {
     if (!args.device || !/^[a-f0-9]{4,32}$/.test(args.device)) throw new Error('请使用 --device 指定要删除的设备标识');
     if (args.device === config.device) throw new Error('不能删除正在采集的本机，请先暂停同步并在另一台电脑操作');
     const result = await request(config, '/forget', { source: 'codex', device: args.device }, config.writeToken);
-    output({ removed: result.removed }); return;
+    output({ removed: result.removed, liveRemoved: result.liveRemoved || 0 }); return;
   }
   if (args.command === 'join') {
     let text = ''; for await (const part of process.stdin) { text += part; if (text.length > 4096) throw new Error('加入串过长'); }

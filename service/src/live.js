@@ -127,7 +127,7 @@ export function mergeLive(rows, now) {
   const sessions = [];
   const devices = [];
   for (const [dev, row] of Object.entries(rows)) {
-    if (!row || now - row.at > KEEP_MS) continue;
+    if (!row || row.forgotten || now - row.at > KEEP_MS) continue;
     devices.push({ dev, at: row.at, tier: row.tier, ...(row.seq ? { seq: row.seq } : {}) });
     for (const s0 of row.sessions) {
       const s = shift(s0, row.skew);
@@ -293,6 +293,20 @@ export class LiveSpace {
       this.source = 'codex'; await this.ctx.storage.put('source', 'codex');
     }
 
+    // 仅由已验证写凭证的 worker 转入；保留序号墓碑，避免删除前的晚到包重新显示。
+    if (req.method === 'POST' && url.pathname === '/forget') {
+      if (this.source !== 'codex' || url.searchParams.get('source') !== 'codex') return Response.json({ error: 'not_found' }, { status: 404 });
+      const dev = url.searchParams.get('dev');
+      if (dev !== 'default' && !/^[a-f0-9]{4,32}$/.test(dev || '')) return Response.json({ error: 'bad_device' }, { status: 400 });
+      const previous = rows[dev];
+      if (!previous || previous.forgotten) return Response.json({ ok: true, removed: 0 });
+      const tombstone = { at: now, seq: previous.seq || 0, tier: 1, skew: 0, sessions: [], forgotten: true };
+      await this.ctx.storage.put('dev:' + dev, tombstone);
+      rows[dev] = tombstone;
+      await this.schedule(now, Infinity);
+      return Response.json({ ok: true, removed: 1 });
+    }
+
     // 手机登记 / 取消服务器通知(读令牌鉴权,worker 已验):{ id, on, handle?, perm?, long?, wait?, done?, stuck?, lang? }
     if (req.method === 'POST' && url.pathname === '/notify') {
       let b; try { b = await req.json(); } catch { return Response.json({ error: 'bad_json' }, { status: 400 }); }
@@ -334,7 +348,7 @@ export class LiveSpace {
       const clean = sanitizeLive(body);
       if (!clean) return Response.json({ error: 'bad_payload' }, { status: 400 });
       if (rows[dev]?.seq && (!clean.seq || clean.seq <= rows[dev].seq)) return Response.json({ ok: true, ignored: true });
-      if (!rows[dev] && Object.keys(rows).length >= MAX_DEVICES) return Response.json({ error: 'too_many_devices' }, { status: 409 });
+      if ((!rows[dev] || rows[dev].forgotten) && Object.values(rows).filter((r) => !r.forgotten).length >= MAX_DEVICES) return Response.json({ error: 'too_many_devices' }, { status: 409 });
       // 偏差超过一天视为设备时钟坏了,不校(校了反而把时间轴整个挪走)
       const skew = clean.devNow && Math.abs(now - clean.devNow) < 864e5 ? now - clean.devNow : 0;
       const row = { at: now, skew: Math.abs(skew) < 1500 ? 0 : skew, tier: clean.tier, sessions: clean.sessions,

@@ -1023,9 +1023,19 @@ async function handle(req, env, ctx) {
     if (typeof device !== 'string' || !(/^[a-f0-9]{4,32}$/.test(device) || device === 'default')) {
       return err('bad_device');
     }
+    let liveRemoved;
+    if (body.source === 'codex') {
+      if (!env.LIVE) return err('live_disabled', 503);
+      const stub = env.LIVE.get(env.LIVE.idFromName(`${spaceId}:codex`));
+      const response = await stub.fetch(`https://live/forget?source=codex&dev=${device}`, { method: 'POST' });
+      if (!response.ok) return err('live_forget_failed', 503);
+      const result = await response.json();
+      if (!Number.isSafeInteger(result.removed) || result.removed < 0) return err('live_forget_failed', 503);
+      liveRemoved = result.removed;
+    }
     const del = await env.DB.prepare('DELETE FROM snapshots WHERE space_id=?1 AND source=?2 AND device=?3')
       .bind(spaceId, body.source, device).run();
-    return json({ ok: true, removed: (del.meta && del.meta.changes) || 0 });
+    return json({ ok: true, removed: (del.meta && del.meta.changes) || 0, ...(liveRemoved !== undefined ? { liveRemoved } : {}) });
   }
 
   // ---- 重新生成短码 ----

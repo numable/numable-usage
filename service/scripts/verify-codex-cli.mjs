@@ -54,8 +54,19 @@ try {
   await a.run('collect'); assert.equal((await get('/s?source=codex&lite=1')).merged.totals.total, 240);
   await a.run('resume'); await a.run('collect');
   assert.equal((await get('/s?source=codex&lite=1')).merged.totals.total, 300);
-  await a.run('forget', ['--device', 'bbbbbbbbbbbb']);
+  await b.run('live-on'); await b.run('collect');
+  assert.equal((await get('/live?source=codex')).sessions.length, 1);
+  const forgotten = JSON.parse(await a.run('forget', ['--device', 'bbbbbbbbbbbb']));
+  assert.equal(forgotten.liveRemoved, 1);
   merged = (await get('/s?source=codex&lite=1')).merged;
   assert.equal(merged.devices.length, 1); assert.equal(merged.totals.total, 180);
-  console.log('通过：虚构双机初始化、绑定、加入、统计合并、设备身份、实时关闭清空、暂停恢复、删除另一设备；未修改真实配置');
+  assert.equal((await get('/live?source=codex')).sessions.length, 0);
+  assert.ok(!(await get('/live?source=codex')).devices.some((d) => d.dev === 'bbbbbbbbbbbb'));
+  // 新活动会触发实时上报；无新事件的紧邻 collect 可能按既有一分钟补偿规则跳过实时上传。
+  fs.appendFileSync(b.file, JSON.stringify({ type: 'token_usage_record', timestamp: new Date().toISOString(), payload: {
+    response_id: 'new-b', turn_id: 'b', usage: { input_tokens: 10, output_tokens: 2, total_tokens: 12 } } }) + '\n');
+  await b.run('collect');
+  assert.equal((await get('/s?source=codex&lite=1')).merged.totals.total, 312);
+  assert.equal((await get('/live?source=codex')).sessions.length, 1);
+  console.log('通过：虚构双机初始化、绑定、加入、统计合并、设备身份、实时关闭清空、暂停恢复、删除另一设备的历史与实时状态、新活动上报恢复；未修改真实配置');
 } finally { fs.rmSync(temp, { recursive: true, force: true }); }
