@@ -38,6 +38,7 @@ function endpoint(value) {
   }
   return url.origin;
 }
+const configBaselines = new WeakMap();
 function configFor(args, p) {
   const saved = read(p.config, null);
   const homes = [...new Set((args.homes.length ? args.homes : saved?.homes || [path.resolve(process.env.CODEX_HOME || path.join(os.homedir(), '.codex'))]).map((h) => path.resolve(h)))];
@@ -47,9 +48,11 @@ function configFor(args, p) {
   const projects = args.projects ? args.projects === 'on' : saved?.projects || false;
   const target = endpoint(args.endpoint || saved?.endpoint || process.env.NUMABLE_USAGE_ENDPOINT || 'https://usage.numable.app');
   if (saved?.writeToken && saved.endpoint !== target) throw new Error('已绑定的凭证不能发送到另一个服务，请使用独立状态目录');
-  return { version: 1, ...saved, homes, timezone, projects, endpoint: target, live: saved?.live === true,
+  const config = { version: 1, ...saved, homes, timezone, projects, endpoint: target, live: saved?.live === true,
     salt: saved?.salt || crypto.randomBytes(32).toString('hex'),
     device: saved?.device || crypto.randomBytes(12).toString('hex'), sync: saved?.sync || false };
+  configBaselines.set(config, structuredClone(saved || {}));
+  return config;
 }
 function lock(file) {
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
@@ -68,6 +71,28 @@ function lock(file) {
     }
   }
   throw new Error('无法取得采集锁');
+}
+// 所有配置回写共享短锁；只合并本次实际修改的字段，旧采集不能覆盖并发的暂停、卸载或隐私开关。
+async function saveConfig(p, config) {
+  let release;
+  for (let i = 0; ; i++) {
+    try { release = lock(path.join(p.dir, 'config.lock')); break; }
+    catch (error) {
+      if (error.code !== 'LOCK_BUSY' || i >= 100) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  }
+  try {
+    const baseline = configBaselines.get(config) || {}, current = read(p.config, {});
+    const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+    const merged = { ...current };
+    for (const [key, value] of Object.entries(config)) {
+      if (!same(value, baseline[key]) && same(current[key], baseline[key])) merged[key] = value;
+    }
+    atomicWrite(p.config, merged);
+    Object.assign(config, merged);
+    configBaselines.set(config, structuredClone(merged));
+  } finally { release(); }
 }
 async function request(config, route, body, token) {
   const controller = new AbortController();
@@ -141,6 +166,7 @@ async function scan(args, p, config) {
   try {
     // 等锁的期间可能已有其他采集更新序号或开关；取得锁后再读权威配置。
     if (fs.existsSync(p.config)) config = configFor(args, p);
+    const projectionSettings = JSON.stringify([config.homes, config.timezone, config.projects, config.live, config.writeToken]);
     let existing;
     try { existing = read(p.history, null); }
     catch (error) {
@@ -187,8 +213,8 @@ async function scan(args, p, config) {
     atomicWrite(p.snapshot, { ...r.snapshot, collection: r.stats });
     atomicWrite(path.join(p.dir, 'live.json'), live);
     for (const q of queued) try { fs.unlinkSync(q.file); } catch {}
-    config.lastCollect = r.snapshot.collectedAt; atomicWrite(p.config, config);
-    if (config.sync && config.writeToken) {
+    config.lastCollect = r.snapshot.collectedAt; await saveConfig(p, config);
+    if (config.sync && config.writeToken && projectionSettings === JSON.stringify([config.homes, config.timezone, config.projects, config.live, config.writeToken])) {
       const background = args.hookWorker || args.command === 'watch';
       const pending = []; let syncError = null;
       if (!background || Date.now() - (config.lastStatsPush || 0) >= 60000) {
@@ -202,19 +228,22 @@ async function scan(args, p, config) {
       const fingerprint = crypto.createHash('sha256').update(JSON.stringify({ tier: live.tier, sessions: live.sessions })).digest('hex');
       if ((config.live || config.liveClearPending) && (fingerprint !== config.lastLiveFingerprint || Date.now() - (config.lastLivePush || 0) >= 60000)) {
         config.lastLiveSequence = (config.lastLiveSequence || 0) + 1;
-        atomicWrite(p.config, config);
+        await saveConfig(p, config);
         const seq = config.lastLiveSequence;
         pending.push((async () => {
           try {
             const wait = (config.lastLivePush || 0) + 2000 - Date.now();
             if (args.hookWorker && wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
+            const latest = configFor(args, p);
+            // 两秒合并窗口内也可能暂停 / 换空间 / 关闭实时；尚未发出的请求应取消。
+            if (!latest.sync || projectionSettings !== JSON.stringify([latest.homes, latest.timezone, latest.projects, latest.live, latest.writeToken])) return;
             await request(config, `/live?source=codex&dev=${config.device}`, { ...live, seq }, config.writeToken);
             config.lastLivePush = Date.now(); config.lastLiveFingerprint = fingerprint; config.liveClearPending = false;
           } catch (error) { syncError ||= error; }
         })());
       }
       await Promise.all(pending); config.syncError = !!syncError;
-      atomicWrite(p.config, config);
+      await saveConfig(p, config);
       if (syncError) throw syncError;
     }
     return { ...r.snapshot, collection: r.stats };
@@ -241,7 +270,7 @@ async function main(argv = process.argv.slice(2)) {
     process.stdout.write('{}\n');
     return;
   }
-  if (args.command === 'init') { atomicWrite(p.config, config); output('本机采集已初始化，手机同步尚未开启'); return; }
+  if (args.command === 'init') { await saveConfig(p, config); output('本机采集已初始化，手机同步尚未开启'); return; }
   if (args.command === 'collect') {
     if (args.hookWorker) {
       let release;
@@ -259,7 +288,7 @@ async function main(argv = process.argv.slice(2)) {
   }
   if (args.command === 'live-on' || args.command === 'live-off') {
     config.live = args.command === 'live-on'; config.liveClearPending = !config.live;
-    atomicWrite(p.config, config); await scan(args, p, config);
+    await saveConfig(p, config); await scan(args, p, config);
     output(config.live ? '实时状态已开启；手机同步沿用当前开关' : '实时状态已关闭'); return;
   }
   if (args.command === 'live') { output(read(path.join(p.dir, 'live.json'), { tier: 1, sessions: [] })); return; }
@@ -270,7 +299,7 @@ async function main(argv = process.argv.slice(2)) {
       config.salt = state.salt;
       const result = await readQuotaHomes({ binary: args.codexBinary || config.quotaBinary, homes: config.homes, salt: config.writeToken || state.salt, profileSalt: state.salt,
         previous: read(path.join(p.dir, 'quota.json'), null) });
-      atomicWrite(p.history, state); atomicWrite(p.config, config); atomicWrite(path.join(p.dir, 'quota.json'), result);
+      atomicWrite(p.history, state); await saveConfig(p, config); atomicWrite(path.join(p.dir, 'quota.json'), result);
       const snapshot = read(p.snapshot, null);
       if (snapshot && result.supported) atomicWrite(p.snapshot, { ...snapshot, quotas: result.quotas });
       output(result);
@@ -281,7 +310,7 @@ async function main(argv = process.argv.slice(2)) {
     config.quotaAuto = args.command === 'quota-auto-on';
     if (args.codexBinary) config.quotaBinary = args.codexBinary;
     if (config.quotaAuto) config.lastQuotaAttempt = 0;
-    atomicWrite(p.config, config); if (config.quotaAuto) await scan(args, p, config);
+    await saveConfig(p, config); if (config.quotaAuto) await scan(args, p, config);
     output(config.quotaAuto ? '额度自动读取已开启，每五分钟检查一次；请保持后台采集运行' : '额度自动读取已关闭'); return;
   }
   if (['summary', 'export'].includes(args.command)) {
@@ -304,7 +333,7 @@ async function main(argv = process.argv.slice(2)) {
       if (!result.spaceId || !result.writeToken || !result.readToken) throw new Error('服务返回的接入信息不完整');
       Object.assign(config, { spaceId: result.spaceId, writeToken: result.writeToken, readToken: result.readToken });
     }
-    config.sync = true; atomicWrite(p.config, config);
+    config.sync = true; await saveConfig(p, config);
     output('手机同步已开启。运行 collect 上传统计，再运行 credentials 查看读取凭证'); return;
   }
   if (args.command === 'credentials') {
@@ -336,18 +365,18 @@ async function main(argv = process.argv.slice(2)) {
     // 用只读请求验证后再保存，未打印写入凭证。
     await request({ ...config, endpoint: data.endpoint }, '/s?source=codex&lite=1', undefined, data.readToken);
     Object.assign(config, { spaceId: data.spaceId, writeToken: data.writeToken, readToken: data.readToken, sync: true });
-    atomicWrite(p.config, config); output('已加入同一个用量空间'); return;
+    await saveConfig(p, config); output('已加入同一个用量空间'); return;
   }
   if (args.command === 'pause' || args.command === 'resume') {
     if (args.command === 'resume' && !config.writeToken) throw new Error('尚未接入手机，请先运行 connect');
-    config.sync = args.command === 'resume'; atomicWrite(p.config, config); output(config.sync ? '手机同步已恢复' : '手机同步已暂停，本机统计继续保留'); return;
+    config.sync = args.command === 'resume'; await saveConfig(p, config); output(config.sync ? '手机同步已恢复' : '手机同步已暂停，本机统计继续保留'); return;
   }
   if (args.command === 'install') {
-    config.installed = installHooks(config, p); atomicWrite(p.config, config);
+    config.installed = installHooks(config, p); await saveConfig(p, config);
     output('事件钩子已安装。请在 Codex 中检查并信任新增钩子，信任后才会自动采集'); return;
   }
   if (args.command === 'uninstall') {
-    uninstallHooks(config); config.installed = []; config.sync = false; atomicWrite(p.config, config);
+    uninstallHooks(config); config.installed = []; config.sync = false; await saveConfig(p, config);
     atomicWrite(path.join(p.dir, 'stop.json'), { at: Date.now() }); output('已移除本工具的事件钩子并暂停同步，本机记录仍保留'); return;
   }
   if (args.command === 'stop') { atomicWrite(path.join(p.dir, 'stop.json'), { at: Date.now() }); output('已请求停止后台采集'); return; }
