@@ -59,6 +59,9 @@ export function codexVisual(m, rows) {
   }
   const deviceRows = m.devices.slice(0, 4).map((d, i) => ({ i, name: `#${i + 1}`, receivedAt: d.receivedAt,
     fresh: m.now - d.collectedAt <= 10 * 60000 ? 1 : 0 }));
+  const week = Array.from({ length: 7 }, (_, i) => { const date = offset(6 - i), d = days.get(date); return { i, known: observed(date) ? 1 : 0, active: observed(date) && d.total > 0 ? 1 : 0, minutes: observed(date) ? d.activeMinutes : null }; });
+  const minuteMax = Math.max(1, ...week.map((d) => d.minutes || 0));
+  for (const d of week) Object.assign(d, { minuteKnown: d.minutes != null ? 1 : 0, minuteV: ratio(d.minutes, minuteMax), minuteTop: 1 - ratio(d.minutes, minuteMax) });
   return { schema: 1, today: { known: todayKnown ? 1 : 0, value: todayKnown ? compact(today.total) : '--',
     input: todayKnown ? compact(today.input) : '--', output: todayKnown ? compact(today.output) : '--',
     inputV: todayKnown ? ratio(today.input, today.total) : 0, outputV: todayKnown ? ratio(today.output, today.total) : 0,
@@ -68,7 +71,7 @@ export function codexVisual(m, rows) {
     range: { start: offset(29).slice(5), end: m.todayDate.slice(5), total: series.some((d) => d.known) ? compact(series.filter((d) => d.known).reduce((a, d) => a + d.total, 0)) : '--',
       samples: series.filter((d) => d.known).length, max: series.some((d) => d.known) ? compact(maximum === 1 && !series.some((d) => d.total) ? 0 : maximum) : '--' },
     streak: m.known ? streak : '--', heatStart: offset(69).slice(5), heatEnd: m.todayDate.slice(5), activeDates: m.known ? heatValues.filter((d) => d.total > 0).length : '--',
-    week: Array.from({ length: 7 }, (_, i) => ({ i, known: observed(offset(6 - i)) ? 1 : 0, active: observed(offset(6 - i)) && days.get(offset(6 - i)).total > 0 ? 1 : 0 })),
+    week,
     models: ranking(m.models), projects: ranking(m.projects, true), modelCount: m.models.length, projectCount: m.projects.length,
     optional: { cached: cachedKnown ? compact(today.cached) : '--', cachedPct: cachedKnown && today.input ? Math.round(today.cached / today.input * 100) + '%' : '--',
       cachedV: cachedKnown ? ratio(today.cached, today.input) : 0, reasoning: reasoningKnown ? compact(today.reasoning) : '--',
