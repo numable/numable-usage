@@ -1,12 +1,21 @@
 # Codex 用量采集器
 
-在电脑上统计 Codex 用量，并按需同步到 Numable。当前为开发版本，尚未发布安装包或上线工具。
+在电脑上统计 Codex 用量，并按需同步到 Numable。首发版本为 `0.1.0`；各平台验证范围见文末兼容矩阵。
 
 需要 Node.js 18.17 或以上；建议使用当前长期支持版本。采集器不假设 Codex 自带可供外部使用的 Node.js。
 
 ## 本机查看
 
-在仓库根目录运行：
+安装后可直接使用 `numable-codex`：
+
+```sh
+npm install -g numable-codex-usage
+numable-codex init
+numable-codex collect
+numable-codex summary
+```
+
+从源码运行：
 
 ```sh
 node codex/cli.cjs init
@@ -49,7 +58,9 @@ node codex/cli.cjs quota-auto-on
 
 ## 手机同步
 
-服务端 Codex 协议与 Numable 工具包尚未上线，开发期请使用本机或预发布服务，勿将夹具发到生产。本地服务可用 `service/scripts/local-codex.mjs` 启动；用 `NUMABLE_TEST_WRANGLER` 指定已经安装的 `wrangler.js`，配置、数据库与通知中继全部隔离在本机。
+默认同步地址为 `https://usage.numable.app`。在自己的电脑显式运行 `numable-codex connect` 开启同步，再运行 `numable-codex collect`。在 Numable 海外商店安装「Codex 用量」，将 `numable-codex credentials` 输出的读取凭证绑定到工具。同步默认关闭，安装不会自动上传历史。
+
+以下为独立本机开发示例，不要把夹具发到生产。本地服务可用 `service/scripts/local-codex.mjs` 启动；用 `NUMABLE_TEST_WRANGLER` 指定已经安装的 `wrangler.js`。
 
 ```sh
 node codex/cli.cjs init --state-dir /自己的/测试状态目录 --endpoint http://127.0.0.1:8787
