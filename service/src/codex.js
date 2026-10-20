@@ -1,3 +1,4 @@
+import { codexVisual } from './codex-visual.js';
 // Codex 专用数据契约。显式构造白名单，不继承 Claude Code 的缓存与计费口径。
 const HASH = /^[a-f0-9]{24}$/;
 const MODEL = /^[a-zA-Z0-9._-]{1,80}$/;
@@ -48,7 +49,7 @@ export function sanitizeCodex(raw, now = Date.now()) {
       }
       projects[key] = valueClean;
     }
-    days.set(d.date, { date: d.date, ...u, ...counters(d, COUNT), activeMinutes: Math.min(n(d.activeMinutes) ?? 0, 1440), models, projects });
+    days.set(d.date, { date: d.date, ...u, ...counters(d, COUNT), activeMinutes: n(d.activeMinutes) === null ? null : Math.min(d.activeMinutes, 1440), models, projects });
   }
   const quotas = [];
   for (const q of (Array.isArray(raw.quotas) ? raw.quotas : []).slice(0, 32)) {
@@ -151,7 +152,7 @@ export function mergeCodex(rows, anchor = '', now = Date.now(), options = {}) {
   for (let i = days.get(today)?.total || days.get(today)?.turns ? 0 : 1; i < 400; i++) {
     const d = days.get(before(i)); if (!d || !(d.total || d.turns || d.prompts)) break; streak++;
   }
-  return { now, todayDate: today, known, incomplete, timezones: [...timezones], mixedTimezones: timezones.size > 1,
+  const merged = { now, todayDate: today, known, incomplete, timezones: [...timezones], mixedTimezones: timezones.size > 1,
     quotaIncomplete: rows.some((r) => r.quotaDiagnostics?.failures > 0),
     receivedAt, collectedAt, totals, today: todayData, days: list,
     models: [...models.values()].sort((a, b) => b.total - a.total), projects: [...projects.values()].sort((a, b) => b.total - a.total), devices, diagnostics,
@@ -167,4 +168,6 @@ export function mergeCodex(rows, anchor = '', now = Date.now(), options = {}) {
       resetsAt: mainWindow?.resetsAt || null, observedAt: mainQuota?.observedAt || null,
       windowDurationMins: mainWindow?.windowDurationMins || null, bucket: mainQuota?.id || null,
       expired: !!mainWindow && !quotaValid ? 1 : 0 } } };
+  merged.visual = codexVisual(merged, rows);
+  return merged;
 }
