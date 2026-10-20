@@ -12,3 +12,5 @@ test('没有响应时总览和连续天数保留未知；活跃分钟缺失也�
 test('多账号选择最近观测组并保留组序号；极大用量用紧凑单位',async()=>{const r=row();r.quotas=[{id:'codex',account:'a'.repeat(24),observedAt:now-1000,primary:{usedPercent:90,windowDurationMins:300,resetsAt:now/1000+3600}},{id:'codex',account:'b'.repeat(24),observedAt:now,primary:{usedPercent:20,windowDurationMins:180,resetsAt:now/1000+3600}}];r.days[0].input=1e14;r.days[0].total=1e14+20;const v=await merge([r]);assert.equal(v.quota.value,'80%');assert.equal(v.quotaGroup,2);assert.ok(v.today.value.endsWith('T'));assert.ok(v.today.value.length<9);});
 
 test('设备分钟图按每日分钟缩放，缺失和有效零分开',async()=>{const r=row();r.days.push({...r.days[0],date:'2026-10-19',activeMinutes:0});const v=await merge([r]);assert.equal(v.week[6].minuteV,1);assert.equal(v.week[5].minuteKnown,1);assert.equal(v.week[5].minuteV,0);assert.equal(v.week[4].minuteKnown,0);});
+
+test('模型条长度直接对应标注的占比，不把第一名强行画满',async()=>{const r=row();r.days[0].models={'model-a':{input:60,output:15,total:75,responses:1},'model-b':{input:20,output:5,total:25,responses:1}};const v=await merge([r]);assert.equal(v.models[0].pct,'75%');assert.equal(v.models[0].v,.75);assert.equal(v.models[1].v,.25);});

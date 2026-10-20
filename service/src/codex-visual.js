@@ -47,9 +47,9 @@ export function codexVisual(m, rows) {
       state: !w ? 'unknown' : w.resetsAt * 1000 <= m.now ? 'expired' : fresh ? 'observed' : 'stale' };
   });
   const ranking = (values, isProject = false) => {
-    const total = values.reduce((a, d) => a + d.total, 0), max = Math.max(1, ...values.map((d) => d.total));
+    const total = values.reduce((a, d) => a + d.total, 0);
     return values.slice(0, 5).map((d, i) => ({ i, name: isProject ? d.name || `#${i + 1}` : d.name,
-      value: compact(d.total), pct: total ? Math.round(d.total / total * 100) + '%' : '--', v: ratio(d.total, max) }));
+      value: compact(d.total), pct: total ? Math.round(d.total / total * 100) + '%' : '--', v: ratio(d.total, total) }));
   };
   const optionalKnown = (key) => todayKnown && rows.every((r) => r.days.filter((d) => d.date === m.todayDate).every((d) => d[key] != null));
   const cachedKnown = optionalKnown('cached'), reasoningKnown = optionalKnown('reasoning');
