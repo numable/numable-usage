@@ -1,6 +1,6 @@
 {
   "name": "numable-codex-usage",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "在本机统计 Codex 用量，并按需同步到 Numable",
   "license": "MIT",
   "engines": {

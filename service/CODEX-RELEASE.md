@@ -35,7 +35,7 @@ SQLite 路由检查使用 Node.js 22 或以上；采集器本身声明最低 Nod
 
 独立本机服务启动后另跑 `node service/scripts/verify-codex-cli.mjs`；旧 HTTP 回归使用 `BASE=http://127.0.0.1:端口 node service/test.mjs`。两套服务分别使用独立数据库与端口，避免共享限流。禁止将这些虚构数据播种脚本指向生产。
 
-采集器打包使用 `npm pack ./codex --json --pack-destination 候选目录`。当前白名单为八个文件：`cli.cjs`、`lib/collect.cjs`、`lib/live.cjs`、`lib/quota.cjs`、`lib/background.cjs`、`lib/diagnostics.cjs`、`package.json`、`README.md`。安装候选前校验 SHA256；`npm pack` 不是 npm 发行。
+采集器打包使用 `npm pack ./codex --json --pack-destination 候选目录`。当前白名单为九个文件：`cli.cjs`、`lib/collect.cjs`、`lib/live.cjs`、`lib/quota.cjs`、`lib/records.cjs`、`lib/background.cjs`、`lib/diagnostics.cjs`、`package.json`、`README.md`（0.1.3 起新增 `lib/records.cjs`）。安装候选前校验 SHA256；`npm pack` 不是 npm 发行。
 
 服务先做 `wrangler deploy --dry-run` 检查。使用独立临时配置隔离 `.dev.vars`，保留现行 Worker / D1 / Durable Object 定义并把源码与 migrations 路径改为绝对路径；不读写远端资源。保留构建产物及校验和，不把临时配置当生产部署配置。
 

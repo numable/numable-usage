@@ -1,6 +1,6 @@
 # Codex 用量采集器
 
-在电脑上统计 Codex 用量，并按需同步到 Numable。当前版本为 `0.1.2`；各平台验证范围见文末兼容矩阵。
+在电脑上统计 Codex 用量，并按需同步到 Numable。当前版本为 `0.1.3`；各平台验证范围见文末兼容矩阵。
 
 需要 Node.js 18.17 或以上；建议使用当前长期支持版本。采集器不假设 Codex 自带可供外部使用的 Node.js。
 
@@ -59,7 +59,7 @@ node codex/cli.cjs quota-auto-on
 从0.1.0升级后，请运行以下命令；已运行的后台进程必须重启才能使用新版本：
 
 ```sh
-npm install -g numable-codex-usage@0.1.2
+npm install -g numable-codex-usage@0.1.3
 numable-codex stop
 numable-codex init
 numable-codex start
@@ -179,7 +179,7 @@ Windows、不同 Codex 入口、四端真机与线上发布进度见 meta 仓 `d
 ## macOS 系统托管与退出诊断（0.1.2）
 
 ```sh
-npm install -g numable-codex-usage@0.1.2
+npm install -g numable-codex-usage@0.1.3
 numable-codex autostart-on
 numable-codex status
 ```
@@ -198,3 +198,19 @@ numable-codex status
 `status` 新增 `background.running`、`heartbeatAt`、系统托管 `enabled/loaded`、系统记录的运行次数/最近退出码或信号、最后采集/统计上传时间与日志路径。开关开启、进程存活、心跳更新和上传成功是四个不同状态，不能只凭同步开关判断在线。
 
 诊断日志位于状态目录 `logs/diagnostic.jsonl`，仅当前用户可读；单文件约1 MiB，最多保留三个轮换备份。记录启动、正常停止原因、采集开始/成功/失败、耗时、连续失败次数、HTTP状态码和固定错误分类；不写错误原文、堆栈、令牌、项目/文件路径、命令参数、账号标识或会话内容。安静模式致命失败也会记录并返回非零，便于系统恢复。日志写入失败不阻止采集；SIGKILL、系统关机等可能没有退出事件，不能据此编造退出原因。
+
+
+## 常驻采集减负与历史格式升级（0.1.3）
+
+后台每分钟一轮的采集在没有新日志时不再重读、复制或重写整份历史；有新写入时只处理变化的会话文件。本机历史 `history.json` 改为更紧凑的格式（约减半），并每天清理 430 天以前的条目（统计窗口仍为最近 400 天）。统计结果与旧版一致。
+
+升级后已在运行的后台进程必须重启才会使用新版本：
+
+```sh
+npm install -g numable-codex-usage@0.1.3
+numable-codex stop
+numable-codex start
+numable-codex status
+```
+
+首次运行时旧格式历史会在本机自动转换，无需重算。转换后 0.1.2 及更早版本无法读取该历史（会提示格式不兼容，不会改写文件）；如需退回旧版，请先备份升级前的 `history.json`。

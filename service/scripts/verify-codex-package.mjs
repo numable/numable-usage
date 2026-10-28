@@ -26,7 +26,7 @@ const waitUntil = async (check) => {
 };
 try {
   const archive = suppliedArchive || path.join(temp, JSON.parse(command('npm', ['pack', source, '--json', '--pack-destination', temp]))[0].filename);
-  const expected = ['README.md', 'cli.cjs', 'lib/collect.cjs', 'lib/live.cjs', 'lib/quota.cjs', 'package.json'];
+  const expected = ['README.md', 'cli.cjs', 'lib/background.cjs', 'lib/collect.cjs', 'lib/diagnostics.cjs', 'lib/live.cjs', 'lib/quota.cjs', 'lib/records.cjs', 'package.json'];
   const entries = command('tar', ['-tzf', archive]).split('\n');
   assert.deepEqual(entries.sort(), expected.map((name) => 'package/' + name).sort());
   for (const name of expected) {
@@ -65,5 +65,5 @@ try {
   assert.equal(JSON.parse(run('export')).days[0].total, 120);
   command('npm', ['uninstall', '--global', '--prefix', prefix, '--offline', '--ignore-scripts', '--no-audit', '--no-fund', 'numable-codex-usage']);
   assert.equal(fs.existsSync(bin), false);
-  console.log('通过：tgz 六文件、离线全局安装、可执行入口、独立采集、含中文空格单引号路径的钩子命令、脱敏、卸载保留历史；未发布 npm');
+  console.log(`通过：tgz ${expected.length} 个文件、离线全局安装、可执行入口、独立采集、含中文空格单引号路径的钩子命令、脱敏、卸载保留历史；未发布 npm`);
 } finally { fs.rmSync(temp, { recursive: true, force: true }); }
