@@ -154,6 +154,9 @@ async function discover(roots) {
 async function readFile(filePath, old, salt, options) {
   const stat = await fs.promises.stat(filePath);
   const compressed = /\.(gz|zst)$/.test(filePath);
+  // 同一文件、大小与修改时间都没变时内容不可能变化；常驻采集每分钟扫一遍，不必再打开文件和复制投影。
+  if (old && old.identity === `${stat.dev}:${stat.ino}` && old.size === stat.size && old.mtime === stat.mtimeMs &&
+    old.projectsEnabled === (options.projects === true) && old.liveEnabled === (options.live === true) && old.profile === options.profile) return { file: old, rows: 0 };
   const handle = await fs.promises.open(filePath, 'r');
   const first = Buffer.alloc(Math.min(256, stat.size));
   await handle.read(first, 0, first.length, 0);
@@ -162,9 +165,12 @@ async function readFile(filePath, old, salt, options) {
   const identity = `${stat.dev}:${stat.ino}`;
   // 小文件首段会随追加变化；只有旧文件已超过 256 字节才用首段判断替换。
   const reset = !old || old.identity !== identity || old.offset > stat.size || old.offset >= 256 && old.head !== head || old.projectsEnabled !== (options.projects === true) || old.liveEnabled !== (options.live === true) || old.profile !== options.profile;
+  if (!reset && (compressed ? old.size === stat.size && old.mtime === stat.mtimeMs : old.offset === stat.size)) {
+    // 内容没有新增时只刷新文件元数据，投影本体与旧状态共用，避免整份深复制。
+    return { file: { ...old, head, size: stat.size, mtime: stat.mtimeMs }, rows: 0 };
+  }
   const f = reset ? projection() : structuredClone(old);
   f.identity = identity; f.head = head; f.projectsEnabled = options.projects === true; f.liveEnabled = options.live === true; f.profile = options.profile;
-  if (!reset && (compressed ? f.size === stat.size && f.mtime === stat.mtimeMs : f.offset === stat.size)) return { file: f, rows: 0 };
   if (compressed && !reset) Object.assign(f, projection(), { identity, head, projectsEnabled: options.projects === true, liveEnabled: options.live === true, profile: options.profile });
   const start = compressed ? 0 : f.offset;
   if (!stat.size) return { file: f, rows: 0 };
@@ -202,7 +208,10 @@ async function readFile(filePath, old, salt, options) {
 
 async function collect(roots, previous = initialState(), options = {}) {
   if (previous.version !== VERSION || typeof previous.salt !== 'string') throw new Error('历史格式不兼容，请执行重算');
-  const state = structuredClone(previous);
+  // 只复制外层与文件表；有新增的文件在 readFile 里单独深复制，未变的投影与旧状态共用、不再改写。
+  const state = { ...previous, files: { ...previous.files } };
+  if (previous.liveHooks) state.liveHooks = structuredClone(previous.liveHooks);
+  let changed = false;
   const found = await discover(roots);
   const stats = { files: found.paths.length, scanned: 0, rows: 0, unreadableFiles: 0, ...found.skipped };
   const profiles = roots.map((root) => ({ root: path.resolve(root), id: hash(state.salt, `profile:${path.resolve(root)}`) }));
@@ -211,6 +220,7 @@ async function collect(roots, previous = initialState(), options = {}) {
     try {
       const profile = profiles.filter((entry) => p.startsWith(entry.root + path.sep)).sort((a, b) => b.root.length - a.root.length)[0]?.id;
       const r = await readFile(p, state.files[key], state.salt, { ...options, profile });
+      if (r.file !== state.files[key]) changed = true;
       state.files[key] = r.file; stats.rows += r.rows; stats.scanned += r.rows > 0 ? 1 : 0;
     } catch (e) {
       if (e.code === 'ENOENT' && p.endsWith('.zst')) stats.compressedUnavailable++;
@@ -218,7 +228,8 @@ async function collect(roots, previous = initialState(), options = {}) {
     }
   }
   // 旧文件被上游清理后仍保留数字历史；归档副本由响应身份去重。
-  return { state, stats, snapshot: summarize(state, { ...options, activeProfiles: profiles.map((p) => p.id) }) };
+  // changed 为假表示文件投影与上一轮完全相同，调用方可以跳过整份历史重写。
+  return { state, stats, changed, snapshot: summarize(state, { ...options, activeProfiles: profiles.map((p) => p.id) }) };
 }
 
 function summarize(state, options = {}) {
@@ -255,9 +266,12 @@ function summarize(state, options = {}) {
     if (!r.turn && modernSessions.has(r.session)) { diagnostics.unassignedLegacy++; continue; }
     events.push(r); diagnostics.legacyRecords++;
   }
-  const days = new Map();
+  const days = new Map(), dates = new Map();
   const day = (at) => {
-    const date = dateAt(at, timezone);
+    // 各时区偏移与夏令时切换都落在整刻钟上，同一刻钟内日期必然相同；按刻钟缓存省掉逐条格式化。
+    const slot = Math.floor(at / 900000);
+    let date = dates.get(slot);
+    if (date === undefined) { date = dateAt(at, timezone); dates.set(slot, date); }
     if (!days.has(date)) days.set(date, { date, ...emptyUsage(), responses: 0, turns: 0, sessions: 0, prompts: 0, activeMinutes: 0, models: {}, projects: {} });
     return days.get(date);
   };

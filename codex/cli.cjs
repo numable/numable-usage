@@ -161,14 +161,21 @@ function spawnEventWorker(p) {
   const child = spawn(process.execPath, [__filename, 'collect', '--state-dir', p.dir, '--quiet', '--hook-worker'], { detached: true, stdio: 'ignore', windowsHide: true });
   child.on('error', () => {}); child.unref();
 }
+// 常驻采集每分钟一轮；历史文件自本进程上次读写后没被其他进程替换时，直接复用内存里那份，省掉整份 JSON 解析。
+let historyCache = null;
+function historyStamp(file) {
+  try { const s = fs.statSync(file); return `${s.dev}:${s.ino}:${s.size}:${s.mtimeMs}:${s.ctimeMs}`; } catch { return null; }
+}
 async function scan(args, p, config) {
   const unlock = lock(p.lock);
   try {
     // 等锁的期间可能已有其他采集更新序号或开关；取得锁后再读权威配置。
     if (fs.existsSync(p.config)) config = configFor(args, p);
     const projectionSettings = JSON.stringify([config.homes, config.timezone, config.projects, config.live, config.writeToken]);
+    const cached = historyCache; historyCache = null;
     let existing;
-    try { existing = read(p.history, null); }
+    if (cached && cached.stamp === historyStamp(p.history)) existing = cached.state;
+    else try { existing = read(p.history, null); }
     catch (error) {
       if (!args.rebuild) throw error;
       const backup = path.join(p.dir, `history.corrupt-${Date.now()}.json`);
@@ -199,17 +206,21 @@ async function scan(args, p, config) {
       }
     }
     r.snapshot.quotaDiagnostics = { failures: activeQuota?.failures || 0, profiles: activeQuota?.profileCount || config.homes.length };
+    // 历史只有真变了才整份重写；空闲轮次跳过约 10MB 的序列化与落盘。
+    let dirty = !existing || !!args.rebuild || r.changed || queued.length > 0;
     if (config.live) {
-      r.state.liveHooks ||= { sessions: {} };
+      if (!r.state.liveHooks) { r.state.liveHooks = { sessions: {} }; dirty = true; }
       for (const q of queued.sort((a, b) => (a.event?.at || 0) - (b.event?.at || 0))) absorbHook(r.state.liveHooks, q.event);
-      for (const [id, s] of Object.entries(r.state.liveHooks.sessions)) if (s.lastAt < Date.now() - 24 * 3600e3) delete r.state.liveHooks.sessions[id];
-    } else delete r.state.liveHooks;
+      for (const [id, s] of Object.entries(r.state.liveHooks.sessions)) if (s.lastAt < Date.now() - 24 * 3600e3) { delete r.state.liveHooks.sessions[id]; dirty = true; }
+    } else if (r.state.liveHooks) { delete r.state.liveHooks; dirty = true; }
     if (!config.projects) {
-      for (const f of Object.values(r.state.files)) { f.projectName = null; if (f.live) f.live.projectName = null; }
-      for (const s of Object.values(r.state.liveHooks?.sessions || {})) s.projectName = null;
+      const clear = (o) => { if (o.projectName !== null) dirty = true; o.projectName = null; };
+      for (const f of Object.values(r.state.files)) { clear(f); if (f.live) clear(f.live); }
+      for (const s of Object.values(r.state.liveHooks?.sessions || {})) clear(s);
     }
     const live = config.live ? buildLive(r.state, { projects: config.projects }) : { tier: 1, devNow: Date.now(), sessions: [] };
-    atomicWrite(p.history, r.state);
+    if (dirty) atomicWrite(p.history, r.state);
+    historyCache = { stamp: historyStamp(p.history), state: r.state };
     atomicWrite(p.snapshot, { ...r.snapshot, collection: r.stats });
     atomicWrite(path.join(p.dir, 'live.json'), live);
     for (const q of queued) try { fs.unlinkSync(q.file); } catch {}

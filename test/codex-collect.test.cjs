@@ -182,3 +182,42 @@ test('缺少 zstd 解码器有明确诊断，不把压缩历史当零用量', as
   assert.equal(r.stats.compressedUnavailable, 1);
   assert.equal(r.snapshot.coverage.length, 0);
 });
+
+test('没有新增内容的轮次复用旧投影且不改写上一轮状态，只改时间也不重复计数', async (t) => {
+  const { dir, file, write } = setup(t);
+  write([meta(), context(), record()]);
+  const a = await collect([dir], initialState(), opt);
+  assert.equal(a.changed, true);
+  const key = Object.keys(a.state.files)[0], before = JSON.stringify(a.state);
+  const b = await collect([dir], a.state, opt);
+  assert.equal(b.changed, false);
+  assert.equal(b.state.files[key], a.state.files[key]);
+  assert.deepEqual(b.snapshot, a.snapshot);
+  assert.equal(JSON.stringify(a.state), before);
+  const later = new Date(Date.now() + 5000);
+  fs.utimesSync(file, later, later);
+  const c = await collect([dir], b.state, opt);
+  assert.equal(c.changed, true);
+  assert.equal(c.stats.rows, 0);
+  assert.deepEqual(c.snapshot, a.snapshot);
+  assert.equal((await collect([dir], c.state, opt)).changed, false);
+  fs.appendFileSync(file, JSON.stringify(record('r2', 40, 10)) + '\n');
+  const d = await collect([dir], c.state, opt);
+  assert.equal(d.changed, true);
+  assert.equal(totals(d.snapshot), 170);
+  assert.equal(JSON.stringify(a.state), before);
+});
+
+test('跨日期与夏令时切换时按刻钟缓存的日期与逐条计算一致', async (t) => {
+  const { dir, write } = setup(t);
+  // 洛杉矶午夜与夏令时切换（整点）、加德满都午夜（UTC 18:15）、查塔姆夏令时午夜（UTC 10:15）两侧各取一条。
+  const times = ['2026-03-08T07:59:59Z', '2026-03-08T08:00:00Z', '2026-11-01T06:59:59.999Z', '2026-11-01T07:00:00Z',
+    '2026-10-19T18:14:59Z', '2026-10-19T18:15:00Z', '2026-10-19T10:14:59Z', '2026-10-19T10:15:00Z'];
+  write([meta(), context(), ...times.map((at, i) => row('token_usage_record', { response_id: `r${i}`, turn_id: 't1', usage: u(10, 1) }, at))]);
+  for (const timezone of ['America/Los_Angeles', 'Asia/Kathmandu', 'Pacific/Chatham']) {
+    const r = await collect([dir], initialState(), { now: Date.parse('2026-12-01T00:00:00Z'), timezone });
+    const expected = new Map();
+    for (const at of times) { const date = require('../codex/lib/collect.cjs').dateAt(Date.parse(at), timezone); expected.set(date, (expected.get(date) || 0) + 1); }
+    assert.deepEqual(r.snapshot.days.map((d) => [d.date, d.responses]), [...expected].sort());
+  }
+});
