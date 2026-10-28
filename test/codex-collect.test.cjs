@@ -279,3 +279,18 @@ test('只清理 430 天以前的条目，窗口内统计不变，同一天不重
   const c = await collect([dir], b.state, { ...late, now: late.now + 3600e3 });
   assert.equal(c.changed, false);
 });
+
+test('保留期外的会话实时状态一并清掉，统计不受影响', async (t) => {
+  const { dir, write } = setup(t);
+  const old = '2025-01-01T10:00:00Z';
+  write([meta(), row('turn_context', { turn_id: 't0', model: 'model-a' }, old), row('event_msg', { type: 'task_started', turn_id: 't0' }, old),
+    row('token_usage_record', { response_id: 'old', turn_id: 't0', usage: u(10, 1) }, old)]);
+  const live = { ...opt, live: true, now: Date.parse('2025-01-02T00:00:00Z') };
+  const a = await collect([dir], initialState(), live);
+  assert.ok(Object.values(a.state.files)[0].live);
+  const later = { ...live, now: Date.parse('2026-06-01T00:00:00Z') };
+  const b = await collect([dir], a.state, later);
+  assert.equal(Object.values(b.state.files)[0].live, undefined);
+  assert.ok(Object.values(a.state.files)[0].live);
+  assert.deepEqual(b.snapshot.days, summarize(a.state, later).days);
+});

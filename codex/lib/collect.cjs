@@ -234,6 +234,8 @@ function prune(f, horizon) {
   };
   drop('records', (_, t) => t[AT]); drop('legacy', (_, t) => t[AT]);
   drop('turns', (_, t) => t.at); drop('prompts', (_, t) => t.at); drop('activity', (minute) => Number(minute) * 60000);
+  // 实时投影只展示最近一天有动静的会话；保留期外的会话状态不再需要，续写时会重新建立。
+  if (out.live && out.live.lastAt < horizon) { if (out === f) out = { ...f }; delete out.live; }
   return out;
 }
 
