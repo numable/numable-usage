@@ -221,3 +221,61 @@ test('跨日期与夏令时切换时按刻钟缓存的日期与逐条计算一�
     assert.deepEqual(r.snapshot.days.map((d) => [d.date, d.responses]), [...expected].sort());
   }
 });
+
+const { summarize } = require('../codex/lib/collect.cjs');
+const { pack, unpack } = require('../codex/lib/records.cjs');
+const toV1 = (state) => ({ ...state, version: 1, prunedAt: undefined, files: Object.fromEntries(Object.entries(state.files).map(([k, f]) => {
+  const { ctx, ...rest } = f;
+  const expand = (m) => Object.fromEntries(Object.entries(m).map(([key, t]) => [key, unpack(f, t)]));
+  return [k, { ...rest, records: expand(f.records), legacy: expand(f.legacy) }];
+})) });
+
+test('旧格式历史无损升级为定长数组，统计不变且不改写输入', async (t) => {
+  const { dir, file, write } = setup(t);
+  write([meta(), context(), record(), record('r2', 40, 10), count(300, 60), meta('other'), context('t2'), record('r3', 7, 1, 't2')]);
+  const a = await collect([dir], initialState(), opt);
+  const v1 = toV1(a.state), before = JSON.stringify(v1);
+  const b = await collect([dir], v1, opt);
+  assert.equal(b.state.version, 2);
+  assert.equal(b.changed, true);
+  assert.deepEqual(b.snapshot, a.snapshot);
+  assert.deepEqual(b.state.files, a.state.files);
+  assert.equal(JSON.stringify(v1), before);
+  const f = Object.values(b.state.files)[0];
+  assert.equal(f.ctx.length, 2);
+  assert.ok(Object.values(f.records).every(Array.isArray));
+  fs.appendFileSync(file, JSON.stringify(record('r4', 5, 5, 't2')) + '\n');
+  assert.equal(totals((await collect([dir], b.state, opt)).snapshot), totals(a.snapshot) + 10);
+});
+
+test('定长数组在总量与输入加输出不一致时仍逐值还原', () => {
+  const f = { ctx: [] };
+  const r = { at: 1, session: 's', project: null, model: 'm', turn: null, subagent: true, usage: { input: 3, output: 4, cached: null, reasoning: 0, total: 7 } };
+  assert.deepEqual(unpack(f, pack(f, r)), r);
+  const odd = { ...r, usage: { ...r.usage, total: 9 } };
+  assert.deepEqual(unpack(f, pack(f, odd)), odd);
+  assert.equal(f.ctx.length, 1);
+});
+
+test('只清理 430 天以前的条目，窗口内统计不变，同一天不重复清理', async (t) => {
+  const { dir, write } = setup(t);
+  // 以 2026-03-20 为当前：old 超过 430 天应清掉；edge 在 400 天窗口外但仍在 30 天余量内应保留。
+  const old = '2025-01-01T10:00:00Z', edge = '2025-02-05T10:00:00Z', mid = '2025-12-01T10:00:00Z';
+  write([meta(), row('turn_context', { turn_id: 't0', model: 'model-a' }, old), row('event_msg', { type: 'task_started', turn_id: 't0' }, old),
+    row('token_usage_record', { response_id: 'old', turn_id: 't0', usage: u(10, 1) }, old), row('event_msg', { type: 'user_message', turn_id: 't0' }, old),
+    row('token_usage_record', { response_id: 'edge', turn_id: 't0', usage: u(30, 3) }, edge),
+    row('token_usage_record', { response_id: 'mid', turn_id: 't0', usage: u(20, 2) }, mid)]);
+  const early = { ...opt, now: Date.parse('2025-12-02T00:00:00Z') };
+  const a = await collect([dir], initialState(), early);
+  const late = { ...opt, now: Date.parse('2026-03-20T00:00:00Z') };
+  const b = await collect([dir], a.state, late);
+  const f = Object.values(b.state.files)[0];
+  assert.deepEqual(Object.values(f.records).map((r) => r[0]), [Date.parse(edge), Date.parse(mid)]);
+  assert.equal(Object.keys(f.turns).length, 0);
+  assert.equal(Object.keys(f.prompts).length, 0);
+  assert.equal(Object.keys(f.activity).length, 2);
+  assert.deepEqual(b.snapshot.days, summarize(a.state, late).days);
+  assert.equal(Object.keys(Object.values(a.state.files)[0].records).length, 3);
+  const c = await collect([dir], b.state, { ...late, now: late.now + 3600e3 });
+  assert.equal(c.changed, false);
+});

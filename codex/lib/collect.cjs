@@ -7,8 +7,14 @@ const crypto = require('node:crypto');
 const zlib = require('node:zlib');
 const { spawn } = require('node:child_process');
 const { absorbLog } = require('./live.cjs');
+const R = require('./records.cjs');
+const { AT, CTX, TURN, total, pack } = R;
 
-const VERSION = 1;
+// 2：响应与旧累计记录改为定长数组 + 文件级上下文表；1 的历史在读取时无损升级。
+const VERSION = 2;
+const WINDOW = 400 * 864e5;
+// 统计只看最近 400 天；再多留 30 天，跨窗口边界的同一轮次仍能互相去重。
+const RETAIN = WINDOW + 30 * 864e5;
 const MODEL = /^[a-zA-Z0-9._-]{1,80}$/;
 const LIMIT = /^[a-zA-Z0-9._-]{1,64}$/;
 const n = (x) => Number.isSafeInteger(x) && x >= 0 ? x : null;
@@ -23,11 +29,11 @@ function usage(u) {
   if (cached > input || reasoning > output) return null;
   return { input, output, cached, reasoning, total };
 }
-function addUsage(to, u) {
-  for (const k of Object.keys(emptyUsage())) {
-    // 可选细项缺失时保留未知；总量不受它们影响。
-    to[k] = to[k] === null || u[k] === null ? null : to[k] + u[k];
-  }
+function addPacked(to, t) {
+  // 直接读定长数组累加；可选细项缺失时保留未知，总量不受它们影响。
+  to.input += t[R.INPUT]; to.output += t[R.OUTPUT]; to.total += total(t);
+  to.cached = to.cached === null || t[R.CACHED] === null ? null : to.cached + t[R.CACHED];
+  to.reasoning = to.reasoning === null || t[R.REASONING] === null ? null : to.reasoning + t[R.REASONING];
 }
 function quota(raw, at) {
   if (!raw || !Number.isFinite(at)) return null;
@@ -58,7 +64,7 @@ function initialState() {
 function projection() {
   return { offset: 0, identity: '', head: '', session: null, project: null, projectName: null,
     source: 'unknown', version: null, subagent: false, fork: false, model: 'unknown', turn: null,
-    records: {}, legacy: {}, turns: {}, prompts: {}, activity: {}, quotas: {},
+    ctx: [], records: {}, legacy: {}, turns: {}, prompts: {}, activity: {}, quotas: {},
     cumulative: null, diagnostics: { invalidRows: 0, invalidUsage: 0, missingIdentity: 0 }, lastAt: 0 };
 }
 function processRow(file, row, salt, options = {}) {
@@ -94,7 +100,7 @@ function processRow(file, row, salt, options = {}) {
     if (!u) { file.diagnostics.invalidUsage++; return; }
     if (typeof p.response_id !== 'string') { file.diagnostics.missingIdentity++; return; }
     const key = hash(salt, `response:${p.response_id}`);
-    file.records[key] = { ...base, ...(typeof p.session_id === 'string' ? { session: hash(salt, `session:${p.session_id}`) } : {}), usage: u };
+    file.records[key] = pack(file, { ...base, ...(typeof p.session_id === 'string' ? { session: hash(salt, `session:${p.session_id}`) } : {}), usage: u });
     file.activity[String(Math.floor(at / 60000))] = 1;
   }
   if (row.type !== 'event_msg') return;
@@ -117,7 +123,7 @@ function processRow(file, row, salt, options = {}) {
     file.cumulative = total;
     if (!u) { file.diagnostics.invalidUsage++; return; }
     const key = hash(salt, `legacy:${file.session}:${turn || ''}:${total.input}:${total.output}`);
-    file.legacy[key] = { ...base, usage: u };
+    file.legacy[key] = pack(file, { ...base, usage: u });
     file.activity[String(Math.floor(at / 60000))] = 1;
   }
   if (p.type === 'task_started' && turn) {
@@ -206,12 +212,39 @@ async function readFile(filePath, old, salt, options) {
   return { file: f, rows };
 }
 
+function upgrade(previous) {
+  if (previous.version === VERSION) return previous;
+  const files = {};
+  for (const [name, f] of Object.entries(previous.files)) {
+    const g = { ...f, ctx: [], records: {}, legacy: {} };
+    for (const [key, r] of Object.entries(f.records)) g.records[key] = pack(g, r);
+    for (const [key, r] of Object.entries(f.legacy)) g.legacy[key] = pack(g, r);
+    files[name] = g;
+  }
+  return { ...previous, version: VERSION, files };
+}
+function prune(f, horizon) {
+  // 只在确有过期条目时才复制，没过期的文件仍与旧状态共用。
+  let out = f;
+  const drop = (field, atOf) => {
+    const entries = Object.entries(out[field]);
+    if (!entries.some(([key, v]) => atOf(key, v) < horizon)) return;
+    if (out === f) out = { ...f };
+    out[field] = Object.fromEntries(entries.filter(([key, v]) => atOf(key, v) >= horizon));
+  };
+  drop('records', (_, t) => t[AT]); drop('legacy', (_, t) => t[AT]);
+  drop('turns', (_, t) => t.at); drop('prompts', (_, t) => t.at); drop('activity', (minute) => Number(minute) * 60000);
+  return out;
+}
+
 async function collect(roots, previous = initialState(), options = {}) {
-  if (previous.version !== VERSION || typeof previous.salt !== 'string') throw new Error('历史格式不兼容，请执行重算');
+  if (![1, VERSION].includes(previous.version) || typeof previous.salt !== 'string') throw new Error('历史格式不兼容，请执行重算');
+  const now = options.now || Date.now();
+  const upgraded = upgrade(previous);
   // 只复制外层与文件表；有新增的文件在 readFile 里单独深复制，未变的投影与旧状态共用、不再改写。
-  const state = { ...previous, files: { ...previous.files } };
+  const state = { ...upgraded, files: { ...upgraded.files } };
   if (previous.liveHooks) state.liveHooks = structuredClone(previous.liveHooks);
-  let changed = false;
+  let changed = upgraded !== previous;
   const found = await discover(roots);
   const stats = { files: found.paths.length, scanned: 0, rows: 0, unreadableFiles: 0, ...found.skipped };
   const profiles = roots.map((root) => ({ root: path.resolve(root), id: hash(state.salt, `profile:${path.resolve(root)}`) }));
@@ -228,6 +261,11 @@ async function collect(roots, previous = initialState(), options = {}) {
     }
   }
   // 旧文件被上游清理后仍保留数字历史；归档副本由响应身份去重。
+  // 每天清一次 430 天以前的条目，历史体积不随使用年限无限增长。
+  if (!(state.prunedAt > now - 864e5)) {
+    for (const [key, f] of Object.entries(state.files)) state.files[key] = prune(f, now - RETAIN);
+    state.prunedAt = now; changed = true;
+  }
   // changed 为假表示文件投影与上一轮完全相同，调用方可以跳过整份历史重写。
   return { state, stats, changed, snapshot: summarize(state, { ...options, activeProfiles: profiles.map((p) => p.id) }) };
 }
@@ -235,22 +273,27 @@ async function collect(roots, previous = initialState(), options = {}) {
 function summarize(state, options = {}) {
   const timezone = options.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone;
   const now = options.now || Date.now();
-  const cutoff = now - 400 * 864e5;
+  const cutoff = now - WINDOW;
   const records = new Map(), legacy = new Map(), turns = new Map(), prompts = new Map(), projects = new Map();
   const sessions = new Map(), quotas = new Map(), activity = new Set(), modernTurns = new Set(), modernSessions = new Set();
   const diagnostics = { invalidRows: 0, invalidUsage: 0, missingIdentity: 0, unknownFiles: 0, legacyRecords: 0, unassignedLegacy: 0 };
-  const coverage = new Map();
+  const coverage = new Map(), owner = new Map();
   for (const f of Object.values(state.files)) {
     for (const k of ['invalidRows', 'invalidUsage', 'missingIdentity']) diagnostics[k] += f.diagnostics[k];
     if (!f.session || !f.version) diagnostics.unknownFiles++;
     const ckey = `${f.source}:${f.version || 'unknown'}`;
     coverage.set(ckey, { source: f.source, version: f.version, files: (coverage.get(ckey)?.files || 0) + 1 });
-    for (const [key, r] of Object.entries(f.records)) {
-      if (!records.has(key) || r.at > records.get(key).at || r.at === records.get(key).at && r.usage.total > records.get(key).usage.total) records.set(key, r);
-      modernSessions.add(r.session);
-      if (r.turn) modernTurns.add(r.turn);
+    // 直接读定长数组，不逐条展开成对象；owner 记下每条记录所在文件，用来查上下文表。
+    for (const key in f.records) {
+      const t = f.records[key], best = records.get(key);
+      if (!best || t[AT] > best[AT] || t[AT] === best[AT] && total(t) > total(best)) { records.set(key, t); owner.set(t, f); }
+      modernSessions.add(f.ctx[t[CTX]][0]);
+      if (t[TURN]) modernTurns.add(t[TURN]);
     }
-    for (const [key, r] of Object.entries(f.legacy)) if (!legacy.has(key) || r.at < legacy.get(key).at) legacy.set(key, r);
+    for (const key in f.legacy) {
+      const t = f.legacy[key], best = legacy.get(key);
+      if (!best || t[AT] < best[AT]) { legacy.set(key, t); owner.set(t, f); }
+    }
     for (const [key, r] of Object.entries(f.turns)) if (!turns.has(key) || r.at < turns.get(key).at) turns.set(key, r);
     for (const [key, r] of Object.entries(f.prompts)) if (!prompts.has(key) || r.at < prompts.get(key).at) prompts.set(key, r);
     for (const minute of Object.keys(f.activity)) activity.add(Number(minute));
@@ -261,10 +304,10 @@ function summarize(state, options = {}) {
     }
   }
   const events = [...records.values()];
-  for (const r of legacy.values()) {
-    if (r.turn && modernTurns.has(r.turn)) continue;
-    if (!r.turn && modernSessions.has(r.session)) { diagnostics.unassignedLegacy++; continue; }
-    events.push(r); diagnostics.legacyRecords++;
+  for (const t of legacy.values()) {
+    if (t[TURN] && modernTurns.has(t[TURN])) continue;
+    if (!t[TURN] && modernSessions.has(owner.get(t).ctx[t[CTX]][0])) { diagnostics.unassignedLegacy++; continue; }
+    events.push(t); diagnostics.legacyRecords++;
   }
   const days = new Map(), dates = new Map();
   const day = (at) => {
@@ -275,16 +318,18 @@ function summarize(state, options = {}) {
     if (!days.has(date)) days.set(date, { date, ...emptyUsage(), responses: 0, turns: 0, sessions: 0, prompts: 0, activeMinutes: 0, models: {}, projects: {} });
     return days.get(date);
   };
-  for (const r of events.sort((a, b) => a.at - b.at)) {
-    if (r.at < cutoff || r.at > now + 60000) continue;
-    const d = day(r.at); addUsage(d, r.usage); d.responses++;
-    if (!d.models[r.model]) d.models[r.model] = { ...emptyUsage(), responses: 0 };
-    addUsage(d.models[r.model], r.usage); d.models[r.model].responses++;
-    if (r.project) {
-      if (!d.projects[r.project]) d.projects[r.project] = { ...emptyUsage(), responses: 0, ...(options.projects && projects.get(r.project) ? { name: projects.get(r.project) } : {}) };
-      addUsage(d.projects[r.project], r.usage); d.projects[r.project].responses++;
+  for (const t of events.sort((a, b) => a[AT] - b[AT])) {
+    const at = t[AT];
+    if (at < cutoff || at > now + 60000) continue;
+    const [session, project, subagent] = owner.get(t).ctx[t[CTX]], model = t[R.MODEL];
+    const d = day(at); addPacked(d, t); d.responses++;
+    if (!d.models[model]) d.models[model] = { ...emptyUsage(), responses: 0 };
+    addPacked(d.models[model], t); d.models[model].responses++;
+    if (project) {
+      if (!d.projects[project]) d.projects[project] = { ...emptyUsage(), responses: 0, ...(options.projects && projects.get(project) ? { name: projects.get(project) } : {}) };
+      addPacked(d.projects[project], t); d.projects[project].responses++;
     }
-    if (!r.subagent) sessions.set(`${r.session}:${d.date}`, r.at);
+    if (!subagent) sessions.set(`${session}:${d.date}`, at);
   }
   for (const t of turns.values()) if (!t.subagent && t.at >= cutoff && t.at <= now + 60000) {
     const d = day(t.at); d.turns++; sessions.set(`${t.session}:${d.date}`, t.at);

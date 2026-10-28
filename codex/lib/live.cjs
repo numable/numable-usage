@@ -1,6 +1,7 @@
 'use strict';
 // 实时投影只保存匿名身份、时间与固定分类。原始钩子对象不能落盘或传给子进程。
 const crypto = require('node:crypto');
+const { AT, unpack } = require('./records.cjs');
 const HASH = /^[a-f0-9]{24}$/;
 const MODEL = /^[a-zA-Z0-9._-]{1,64}$/;
 const EVENTS = ['SessionStart', 'SessionEnd', 'UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'PermissionRequest', 'Stop', 'Interrupt', 'PreCompact', 'SubagentStart', 'SubagentStop'];
@@ -190,7 +191,12 @@ function buildLive(state, options = {}) {
   const now = options.now || Date.now(), sessions = new Map(), records = new Map();
   for (const f of Object.values(state.files || {})) {
     if (f.live) sessions.set(f.live.session, mergeSession(sessions.get(f.live.session), f.live));
-    for (const [id, r] of Object.entries(f.records || {})) if (!records.has(id) || r.at >= records.get(id).at) records.set(id, r);
+    // 只有最近一天的记录参与轮次用量；更早的不必解包。同一响应取时刻最晚的副本，先按时刻筛不改变结果。
+    for (const [id, t] of Object.entries(f.records || {})) {
+      if (t[AT] < now - KEEP) continue;
+      const r = unpack(f, t);
+      if (!records.has(id) || r.at >= records.get(id).at) records.set(id, r);
+    }
   }
   for (const s of Object.values(state.liveHooks?.sessions || {})) sessions.set(s.session, mergeSession(sessions.get(s.session), s));
   const tokenTotals = new Map();

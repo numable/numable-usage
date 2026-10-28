@@ -152,3 +152,16 @@ test('后台启动确认真实进程取得锁，重复启动复用，停止后�
     run('start'); assert.equal(JSON.parse(fs.readFileSync(path.join(state, 'watch.lock'))).pid, pid);
   } finally { run('stop'); await until(() => !fs.existsSync(path.join(state, 'watch.lock'))); }
 });
+test('一天内的旧轮次仍按响应记录汇总用量，超过一天的记录不再计入', () => {
+  const file = C.projection(), at = (n) => new Date(now + n).toISOString();
+  const row = (type, payload, n = 0) => C.processRow(file, { type, payload, timestamp: at(n) }, salt, { live: true });
+  row('session_meta', { id: 's1', source: 'cli', cli_version: '0.163.0' });
+  row('event_msg', { type: 'task_started', turn_id: 't1' });
+  row('token_usage_record', { response_id: 'r1', session_id: 's1', turn_id: 't1', usage: { input_tokens: 100, output_tokens: 20 } }, 1000);
+  row('event_msg', { type: 'task_complete', turn_id: 't1' }, 2000);
+  row('event_msg', { type: 'task_started', turn_id: 't2' }, 20 * 3600e3);
+  row('token_usage_record', { response_id: 'r2', session_id: 's1', turn_id: 't2', usage: { input_tokens: 5, output_tokens: 1 } }, 20 * 3600e3 + 1000);
+  const turns = (n) => L.buildLive({ files: { f: file } }, { now: now + n }).sessions[0].turns.map((t) => t.out);
+  assert.deepEqual(turns(20 * 3600e3 + 2000), [20, 1]);
+  assert.deepEqual(turns(24 * 3600e3 + 5000), [0, 1]);
+});
