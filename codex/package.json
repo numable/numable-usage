@@ -1,10 +1,20 @@
 {
   "name": "numable-codex-usage",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "description": "在本机统计 Codex 用量，并按需同步到 Numable",
   "license": "MIT",
-  "engines": { "node": ">=18.17" },
-  "bin": { "numable-codex": "cli.cjs" },
-  "files": ["cli.cjs", "lib/", "README.md"],
-  "scripts": { "test": "node --test ../test/codex-*.test.cjs" }
+  "engines": {
+    "node": ">=18.17"
+  },
+  "bin": {
+    "numable-codex": "cli.cjs"
+  },
+  "files": [
+    "cli.cjs",
+    "lib/",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test ../test/codex-*.test.cjs"
+  }
 }

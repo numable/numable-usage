@@ -40,8 +40,10 @@ export function codexVisual(m, rows) {
   const windows = ['primary', 'secondary'].map((key, i) => {
     const w = quota?.[key]; const fresh = !!w && w.resetsAt * 1000 > m.now && quota.observedAt <= m.now && m.now - quota.observedAt <= 15 * 60000;
     const remaining = fresh ? Math.max(0, 100 - w.usedPercent) : null;
+    // 展示层保留最后一次观测；有效性与提醒仍严格使用fresh。
+    const lastRemaining = w && quota.observedAt <= m.now ? Math.max(0, 100 - w.usedPercent) : null;
     const minutes = w?.windowDurationMins;
-    return { i, available: fresh ? 1 : 0, remaining, value: remaining == null ? '--' : compact(remaining) + '%', v: ratio(remaining, 100),
+    return { i, lastRemaining, lastValue: lastRemaining == null ? '--' : compact(lastRemaining) + '%', lastV: ratio(lastRemaining, 100), available: fresh ? 1 : 0, remaining, value: remaining == null ? '--' : compact(remaining) + '%', v: ratio(remaining, 100),
       observedAt: quota?.observedAt || null, resetsAt: w?.resetsAt || null,
       duration: minutes ? (minutes % 1440 === 0 ? `${minutes / 1440}d` : minutes % 60 === 0 ? `${minutes / 60}h` : `${minutes}m`) : '--',
       state: !w ? 'unknown' : w.resetsAt * 1000 <= m.now ? 'expired' : fresh ? 'observed' : 'stale' };

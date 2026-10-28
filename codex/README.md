@@ -1,6 +1,6 @@
 # Codex 用量采集器
 
-在电脑上统计 Codex 用量，并按需同步到 Numable。首发版本为 `0.1.0`；各平台验证范围见文末兼容矩阵。
+在电脑上统计 Codex 用量，并按需同步到 Numable。当前版本为 `0.1.2`；各平台验证范围见文末兼容矩阵。
 
 需要 Node.js 18.17 或以上；建议使用当前长期支持版本。采集器不假设 Codex 自带可供外部使用的 Node.js。
 
@@ -28,7 +28,7 @@ node codex/cli.cjs status
 
 Codex 的设备删除同时清除历史统计和实时视图。删除不撤销该电脑已有的写入凭证，也不清理它的本机历史；仍在同步的电脑有新活动或下一次实时补偿上报时可以重新出现。想持续移除一台电脑，应先在那台电脑运行 `pause` 或 `uninstall`，再从另一台电脑执行 `forget`。服务在 24 小时内保留删除前的实时序号，拒绝旧包复活会话；更新的正常上报仍可恢复。
 
-本机采集默认不联网。配置与历史保存在 `~/.numable/codex-usage/`，目录及文件分别以仅当前用户可访问的权限创建。
+本机统计默认不向 Numable 同步。已开启的额度检查会在采集时通过本机 Codex 协议请求官方额度，可用 `quota-auto-off` 关闭。配置与历史保存在 `~/.numable/codex-usage/`，目录及文件分别以仅当前用户可访问的权限创建。
 
 首次扫描需要读取现有会话；之后只处理追加的完整行。支持 `sessions/` 与 `archived_sessions/`，gzip 归档可直接读取；zstd 归档需要系统提供 `zstd`。缺少解码器时会标注未读取，不伪装成零用量。
 
@@ -53,6 +53,20 @@ node codex/cli.cjs quota-auto-on
 ```
 
 主动读取通过本机 Codex 协议完成，不创建会话，不要求复制 OpenAI 登录凭证。账号标识在本机匿名化；加入同一空间后使用空间范围的匿名标识，以便服务端合并同账号多台电脑的额度。不能识别账号的日志快照按设备分别展示。
+
+0.1.1 的 `init` 在首次配置或旧版未设置时开启每五分钟只读额度检查；明确执行过 `quota-auto-off` 的选择保持不变。初始化本身不启动协议读取或后台进程，也不自动上传历史。
+
+从0.1.0升级后，请运行以下命令；已运行的后台进程必须重启才能使用新版本：
+
+```sh
+npm install -g numable-codex-usage@0.1.2
+numable-codex stop
+numable-codex init
+numable-codex start
+numable-codex status
+```
+
+`status` 会显示 `quotaAuto`、`quotaStatus` 和开启指引；如需主动开启，可运行 `numable-codex quota-auto-on`。额度观测超过15分钟或窗口到期后，页面只保留带过期标识的上次值，不将其当作当前额度。电脑休眠、离线、采集停止或读取失败均可能导致观测过期。
 
 `quota-auto-on` 显式开启每五分钟读取，需后台采集运行；`quota-auto-off` 关闭。多个目录分别连接，单个目录失败会保留其旧观测并标注不完整。macOS 的命令行启动器不可用时，会尝试已安装桌面端的内置可执行文件；也可显式指定路径。
 
@@ -160,3 +174,27 @@ Windows 上默认使用系统 Windows PowerShell，并额外经 cmd / PowerShell
 默认后台采集只在当前用户会话中运行；`start` 不注册开机启动服务。电脑重启后需再次运行。真实钩子和定时补偿互补，钩子尚未信任时仍可手动 `collect` 或运行 `start` 采集历史。
 
 Windows、不同 Codex 入口、四端真机与线上发布进度见 meta 仓 `doc/codex-usage-impl-plan.md`，不能用本机测试通过代替。
+
+
+## macOS 系统托管与退出诊断（0.1.2）
+
+```sh
+npm install -g numable-codex-usage@0.1.2
+numable-codex autostart-on
+numable-codex status
+```
+
+`autostart-on` 为当前用户安装 LaunchAgent，并将已有手动采集进程切换到系统托管：登录后自动启动，进程退出后由系统恢复（节流约15秒）。无需管理员权限；不会创建同步空间、修改凭证或开启已暂停的同步。首次使用仍需先 `init`，是否同步由 `connect/pause/resume` 控制。开机后需要登录该用户，退出登录或电脑休眠期间不保证上传。
+
+托管使用明确的命令参数，不经过 Shell，登录项不含同步令牌。启用时将当前已验证的 Node.js 可执行文件固定到状态目录的 `runtime/node`，先验证能够独立运行，避免原桌面应用升级或启动器路径失效影响后台。需要 Node.js 18.17 或以上；全局 npm 程序被移除或目录改名后，需重新安装并运行 `autostart-on`。Node.js 安全更新后应再次运行该命令刷新固定运行时。
+
+- `stop` 会先卸载本次已加载的系统任务，再确认采集进程停止，避免刚停就被拉起；登录项文件保留，下次登录恢复。
+- `start` 在有登录项时重新加载系统任务；未配置托管时沿用手动后台方式。
+- `autostart-off` 移除登录项并停止后台，保留配置、历史与同步开关。
+- `uninstall` 同时移除本工具系统托管和事件钩子、暂停同步，保留历史。直接 `npm uninstall` 前请先执行 `numable-codex uninstall`。
+
+本版系统托管支持 **macOS**。Windows / Linux 仍用原有 `start/watch/stop`，新增诊断日志同样可用；不宣称这些平台已有系统自启，Windows 原生仍待验。
+
+`status` 新增 `background.running`、`heartbeatAt`、系统托管 `enabled/loaded`、系统记录的运行次数/最近退出码或信号、最后采集/统计上传时间与日志路径。开关开启、进程存活、心跳更新和上传成功是四个不同状态，不能只凭同步开关判断在线。
+
+诊断日志位于状态目录 `logs/diagnostic.jsonl`，仅当前用户可读；单文件约1 MiB，最多保留三个轮换备份。记录启动、正常停止原因、采集开始/成功/失败、耗时、连续失败次数、HTTP状态码和固定错误分类；不写错误原文、堆栈、令牌、项目/文件路径、命令参数、账号标识或会话内容。安静模式致命失败也会记录并返回非零，便于系统恢复。日志写入失败不阻止采集；SIGKILL、系统关机等可能没有退出事件，不能据此编造退出原因。

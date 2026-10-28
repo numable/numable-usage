@@ -5,6 +5,8 @@ const path = require('node:path');
 const os = require('node:os');
 const crypto = require('node:crypto');
 const { spawn } = require('node:child_process');
+const background = require('./lib/background.cjs');
+const { diagnostic, errorKind, watcher } = require('./lib/diagnostics.cjs');
 const { collect, initialState, atomicWrite, hash } = require('./lib/collect.cjs');
 const { readQuotaHomes } = require('./lib/quota.cjs');
 const { sanitizeHook, absorbHook, buildLive } = require('./lib/live.cjs');
@@ -101,7 +103,7 @@ async function request(config, route, body, token) {
     const r = await fetch(config.endpoint + route, { method: body === undefined ? 'GET' : 'POST', redirect: 'error', signal: controller.signal,
       headers: { 'content-type': 'application/json', ...(token ? { authorization: `Bearer ${token}` } : {}) },
       ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
-    if (!r.ok) throw new Error(`服务请求失败（${r.status}），请检查连接后重试`);
+    if (!r.ok) throw Object.assign(new Error(`服务请求失败（${r.status}），请检查连接后重试`), { httpStatus: r.status });
     return await r.json();
   } finally { clearTimeout(timer); }
 }
@@ -263,7 +265,7 @@ async function scan(args, p, config) {
 async function main(argv = process.argv.slice(2)) {
   const args = parse(argv), p = paths(args);
   if (args.command === 'help' || args.command === '--help') {
-    console.log('Codex 用量\ninit：初始化本机采集（默认不同步）\ncollect：增量采集；--rebuild：重算\nsummary：查看统计；--json：导出纯数字快照\nstatus：查看采集与同步状态\nquota：主动读取额度；--codex-binary 指定 Codex\nquota-auto-on/off：开启或关闭每五分钟读取额度\nlive-on/off：开启或关闭匿名实时状态；live：查看实时投影\ndevices：列出已接入电脑\nforget：删除 --device 指定的其他电脑数据\nconnect：创建读取凭证并开启同步\ncredentials：显示手机使用的读取凭证\npause：暂停同步\nresume：恢复已绑定的同步\njoin：从标准输入读取另一台电脑生成的加入串\nlink：生成供自己另一台电脑使用的加入串\ninstall：安装事件钩子（之后需在 Codex 中信任）\nuninstall：仅移除本工具安装的钩子，保留本机记录\nstart：后台启动并确认运行；watch：在前台每 60 秒补充采集；stop：请求停止后台采集\n通用选项：--home 目录（可重复）、--state-dir 目录、--timezone 时区、--endpoint 服务地址、--projects on|off');
+    console.log('Codex 用量\ninit：初始化本机采集（默认不同步）\ncollect：增量采集；--rebuild：重算\nsummary：查看统计；--json：导出纯数字快照\nstatus：查看采集与同步状态\nquota：主动读取额度；--codex-binary 指定 Codex\nquota-auto-on/off：开启或关闭每五分钟读取额度\nlive-on/off：开启或关闭匿名实时状态；live：查看实时投影\ndevices：列出已接入电脑\nforget：删除 --device 指定的其他电脑数据\nconnect：创建读取凭证并开启同步\ncredentials：显示手机使用的读取凭证\npause：暂停同步\nresume：恢复已绑定的同步\njoin：从标准输入读取另一台电脑生成的加入串\nlink：生成供自己另一台电脑使用的加入串\ninstall：安装事件钩子（之后需在 Codex 中信任）\nuninstall：仅移除本工具安装的钩子，保留本机记录\nautostart-on/off：开启/移除 macOS 登录自启与退出自动恢复\nstart：后台启动并确认运行；watch：在前台每 60 秒补充采集；stop：请求停止后台采集\n通用选项：--home 目录（可重复）、--state-dir 目录、--timezone 时区、--endpoint 服务地址、--projects on|off');
     return;
   }
   const config = configFor(args, p);
@@ -281,7 +283,12 @@ async function main(argv = process.argv.slice(2)) {
     process.stdout.write('{}\n');
     return;
   }
-  if (args.command === 'init') { await saveConfig(p, config); output('本机采集已初始化，手机同步尚未开启'); return; }
+  if (args.command === 'init') {
+    // 首次配置或旧版未设置时启用只读额度检查，保留用户明确关闭的选择。
+    if (typeof read(p.config, {}).quotaAuto !== 'boolean') config.quotaAuto = true;
+    await saveConfig(p, config);
+    output(`本机采集已初始化；手机同步${config.sync ? '已开启' : '尚未开启'}。${config.quotaAuto ? '已启用每五分钟只读额度检查，运行 start 保持后台采集；可用 quota-auto-off 关闭' : '额度自动读取已关闭；可用 quota-auto-on 开启'}`); return;
+  }
   if (args.command === 'collect') {
     if (args.hookWorker) {
       let release;
@@ -329,10 +336,15 @@ async function main(argv = process.argv.slice(2)) {
     if (!snapshot) throw new Error('还没有用量记录，请先运行 collect');
     output(snapshot); return;
   }
+  if (args.command === 'autostart-on' || args.command === 'autostart-off') {
+    if (!fs.existsSync(p.config)) throw new Error('请先运行 init 初始化本机采集');
+    if (args.command === 'autostart-on') await background.enable(p.dir); else await background.disable(p.dir);
+    output(args.command === 'autostart-on' ? '系统托管已开启：登录后自动启动，异常退出后自动恢复' : '系统托管已移除，后台采集已停止'); return;
+  }
   if (args.command === 'status') {
     const snapshot = read(p.snapshot, null);
-    output({ initialized: fs.existsSync(p.config), sync: config.sync, paired: !!config.writeToken, live: config.live,
-      quotaAuto: config.quotaAuto === true, quotaStatus: config.quotaStatus || null, syncError: config.syncError || null,
+    output({ background: { ...watcher(p.dir), ...background.serviceStatus(p.dir) }, diagnosticLog: path.join(p.dir, 'logs/diagnostic.jsonl'), lastCollect: config.lastCollect || null, lastStatsPush: config.lastStatsPush || null, initialized: fs.existsSync(p.config), sync: config.sync, paired: !!config.writeToken, live: config.live,
+      quotaAuto: config.quotaAuto === true, quotaHint: config.quotaAuto ? '请保持后台采集运行；读取失败时检查 Codex 登录状态' : '运行 numable-codex quota-auto-on，再运行 numable-codex start', quotaStatus: config.quotaStatus || null, syncError: config.syncError ?? null,
       collectedAt: snapshot?.collectedAt || null, timezone: config.timezone, projects: config.projects,
       coverage: snapshot?.coverage || [], diagnostics: snapshot?.diagnostics || null, collection: snapshot?.collection || null,
       hooksInstalled: !!config.installed?.length, hooksTrust: config.installed?.length ? 'check-in-codex' : null });
@@ -387,13 +399,15 @@ async function main(argv = process.argv.slice(2)) {
     output('事件钩子已安装。请在 Codex 中检查并信任新增钩子，信任后才会自动采集'); return;
   }
   if (args.command === 'uninstall') {
+    if (background.installed(p.dir)) await background.disable(p.dir); else await background.stop(p.dir);
     uninstallHooks(config); config.installed = []; config.sync = false; await saveConfig(p, config);
     atomicWrite(path.join(p.dir, 'stop.json'), { at: Date.now() }); output('已移除本工具的事件钩子并暂停同步，本机记录仍保留'); return;
   }
-  if (args.command === 'stop') { atomicWrite(path.join(p.dir, 'stop.json'), { at: Date.now() }); output('已请求停止后台采集'); return; }
+  if (args.command === 'stop') { await background.stop(p.dir); output('后台采集已停止；已配置的登录自启会在下次登录后恢复'); return; }
   if (args.command === 'start') {
     if (!fs.existsSync(p.config)) throw new Error('请先运行 init 初始化本机采集');
-    const watchLock = path.join(p.dir, 'watch.lock'), previous = read(watchLock, null);
+    if (background.installed(p.dir)) { await background.managedStart(p.dir); output('系统托管的后台采集已启动'); return; }
+    const watchLock = path.join(p.dir, 'watch.lock'), previous = watcher(p.dir);
     if (previous?.pid) {
       try { process.kill(previous.pid, 0); output('后台采集已在运行'); return; }
       catch (e) { if (e.code !== 'ESRCH') throw e; }
@@ -401,33 +415,51 @@ async function main(argv = process.argv.slice(2)) {
     const child = spawn(process.execPath, [__filename, 'watch', '--state-dir', p.dir, '--quiet'], { detached: true, stdio: 'ignore', windowsHide: true });
     let failed = false; child.once('error', () => { failed = true; }); child.unref();
     for (let i = 0; i < 40 && !failed; i++) {
-      if (read(watchLock, null)?.pid === child.pid) { output('后台采集已启动'); return; }
+      if (watcher(p.dir).pid === child.pid) { output('后台采集已启动'); return; }
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
     throw new Error('未能确认后台采集启动，请运行 watch 查看状态');
   }
   if (args.command === 'watch') {
     const release = lock(path.join(p.dir, 'watch.lock')), startedAt = Date.now();
-    let stopped = false;
-    process.once('SIGINT', () => { stopped = true; }); process.once('SIGTERM', () => { stopped = true; });
+    let stopped = false, reason = 'normal', failures = 0;
+    diagnostic(p.dir, 'watch_start', { sync: config.sync, quotaAuto: config.quotaAuto });
+    atomicWrite(path.join(p.dir, 'heartbeat.json'), { pid: process.pid, at: Date.now() });
+    process.once('SIGINT', () => { stopped = true; reason = 'signal'; }); process.once('SIGTERM', () => { stopped = true; reason = 'signal'; });
     try {
       while (!stopped) {
-        if ((read(path.join(p.dir, 'stop.json'), {})?.at || 0) >= startedAt) break;
-        try { await scan(args, p, configFor(args, p)); } catch { if (!args.quiet) console.error('本轮采集未完成，将在下一轮重试'); }
+        if ((read(path.join(p.dir, 'stop.json'), {})?.at || 0) >= startedAt) { reason = 'stop_request'; break; }
+        const scanStart = Date.now(); diagnostic(p.dir, 'scan_start');
+        try {
+          await scan(args, p, configFor(args, p)); failures = 0;
+          const latest = read(p.config, {}); diagnostic(p.dir, 'scan_ok', { elapsedMs: Date.now() - scanStart, lastCollect: latest.lastCollect, lastStatsPush: latest.lastStatsPush, sync: latest.sync, quotaStatus: latest.quotaStatus });
+        } catch (error) {
+          failures++; diagnostic(p.dir, 'scan_failed', { elapsedMs: Date.now() - scanStart, failures, kind: errorKind(error), httpStatus: error.httpStatus });
+          if (!args.quiet) console.error('本轮采集未完成，将在下一轮重试');
+        }
         for (let i = 0; i < 60 && !stopped; i++) {
-          if ((read(path.join(p.dir, 'stop.json'), {})?.at || 0) >= startedAt) { stopped = true; break; }
+          if (i % 10 === 0) atomicWrite(path.join(p.dir, 'heartbeat.json'), { pid: process.pid, at: Date.now(), failures });
+          if ((read(path.join(p.dir, 'stop.json'), {})?.at || 0) >= startedAt) { stopped = true; reason = 'stop_request'; break; }
           await new Promise((resolve) => setTimeout(resolve, 1000));
         }
       }
-    } finally { release(); }
+    } finally { diagnostic(p.dir, 'watch_stop', { reason }); release(); }
     return;
   }
   throw new Error('无法识别命令，请运行 help 查看用法');
 }
-if (require.main === module) main().catch((e) => {
+if (require.main === module) {
+  const failure = error => {
+    try { diagnostic(paths(parse(process.argv.slice(2))).dir, 'fatal', { kind: errorKind(error) }); } catch {}
+    process.exit(1);
+  };
+  process.once('uncaughtException', failure); process.once('unhandledRejection', failure);
+  main().catch((e) => {
+  try { diagnostic(paths(parse(process.argv.slice(2))).dir, 'fatal', { kind: errorKind(e), httpStatus: e.httpStatus }); } catch {}
   if (process.argv[2] === 'hook') { process.stdout.write('{}\n'); return; }
-  if (process.argv.includes('--quiet')) return;
+  if (process.argv.includes('--quiet')) { process.exitCode = 1; return; }
   console.error(e.message && !/ENOENT|EACCES|ENOSPC|fetch failed/.test(e.message) ? e.message : '操作未完成，请检查本机目录、网络与可用空间后重试');
   process.exitCode = 1;
-});
+  });
+}
 module.exports = { parse, paths, endpoint, configFor, lock, installHooks, uninstallHooks, scan, request, main, hookCommand };

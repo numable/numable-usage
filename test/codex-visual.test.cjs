@@ -14,3 +14,12 @@ test('多账号选择最近观测组并保留组序号；极大用量用紧凑�
 test('设备分钟图按每日分钟缩放，缺失和有效零分开',async()=>{const r=row();r.days.push({...r.days[0],date:'2026-10-19',activeMinutes:0});const v=await merge([r]);assert.equal(v.week[6].minuteV,1);assert.equal(v.week[5].minuteKnown,1);assert.equal(v.week[5].minuteV,0);assert.equal(v.week[4].minuteKnown,0);});
 
 test('模型条长度直接对应标注的占比，不把第一名强行画满',async()=>{const r=row();r.days[0].models={'model-a':{input:60,output:15,total:75,responses:1},'model-b':{input:20,output:5,total:25,responses:1}};const v=await merge([r]);assert.equal(v.models[0].pct,'75%');assert.equal(v.models[0].v,.75);assert.equal(v.models[1].v,.25);});
+
+
+test('过期额度保留上次展示值但不恢复有效性，零和未知窗口不同',async()=>{
+ const r=row();r.quotas=[{id:'codex',account:'a'.repeat(24),observedAt:now-3600000,primary:{usedPercent:35,windowDurationMins:300,resetsAt:now/1000-1},secondary:null}];
+ let v=await merge([r]);assert.equal(v.quota.lastValue,'65%');assert.equal(v.quota.lastV,.65);assert.equal(v.quota.available,0);assert.equal(v.quota.value,'--');assert.equal(v.windows[1].lastValue,'--');
+ const {mergeCodex}=await import('../service/src/codex.js');assert.equal(mergeCodex([r],'2026-10-20',now).alerts.quota.key,'');
+ r.quotas[0].primary.usedPercent=100;v=await merge([r]);assert.equal(v.quota.lastValue,'0%');assert.equal(v.quota.lastV,0);
+ r.quotas[0].observedAt=now+1000;v=await merge([r]);assert.equal(v.quota.lastValue,'--');
+});

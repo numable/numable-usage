@@ -46,7 +46,7 @@ function readQuota({ binary = process.env.NUMABLE_CODEX_BINARY || 'codex', home,
         finish(null, { observedAt, scope: hash(salt, 'quota-scope'), supported: quotas.length > 0, quotas });
       }
     });
-    send({ id: 1, method: 'initialize', params: { clientInfo: { name: 'numable_codex_usage', version: '0.1.0' }, capabilities: { experimentalApi: true } } });
+    send({ id: 1, method: 'initialize', params: { clientInfo: { name: 'numable_codex_usage', version: '0.1.2' }, capabilities: { experimentalApi: true } } });
   });
 }
 async function readQuotaHomes({ homes, salt, profileSalt = salt, previous, ...options }) {

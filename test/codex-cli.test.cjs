@@ -23,6 +23,7 @@ test('本机初始化、增量采集、导出和状态不会自动联网，设�
   const rows = [{ type: 'session_meta', payload: { id: 'main', source: 'cli', cli_version: '0.1.0' } },
     { type: 'token_usage_record', timestamp: new Date().toISOString(), payload: { response_id: 'r1', usage: { input_tokens: 100, output_tokens: 20 } } }];
   fs.writeFileSync(path.join(home, 'sessions', 'a.jsonl'), rows.map(JSON.stringify).join('\n') + '\n');
+  run('quota-auto-off');
   const first = run('collect'); assert.equal(first.status, 0, first.stderr);
   const snapshot = JSON.parse(first.stdout); assert.equal(snapshot.days[0].total, 120);
   assert.equal(JSON.parse(run('collect').stdout).collection.rows, 0);
@@ -76,8 +77,28 @@ test('未知命令、损坏历史与缺少凭证都明确失败', (t) => {
   const { state, run } = setup(t);
   assert.equal(run('no-such-command').status, 1);
   assert.equal(run('credentials').status, 1);
-  run('init'); fs.writeFileSync(path.join(state, 'history.json'), '{bad}');
+  run('init'); run('quota-auto-off'); fs.writeFileSync(path.join(state, 'history.json'), '{bad}');
   assert.equal(run('collect').status, 1);
   assert.equal(run('collect', ['--rebuild']).status, 0);
   assert.ok(fs.readdirSync(state).some((f) => /^history.corrupt-\d+\.json$/.test(f)));
+});
+
+
+test('首次配置启用额度读取，旧版迁移保留显式关闭且不改变同步', (t) => {
+  const { state, run } = setup(t);
+  assert.equal(run('init').status, 0);
+  const file = path.join(state, 'config.json');
+  let config = JSON.parse(fs.readFileSync(file));
+  assert.equal(config.quotaAuto, true); assert.equal(config.sync, false);
+  config.quotaAuto = false; config.sync = true;
+  fs.writeFileSync(file, JSON.stringify(config));
+  const repeated = run('init'); assert.equal(repeated.status, 0);
+  assert.ok(repeated.stdout.includes('手机同步已开启'));
+  assert.equal(JSON.parse(fs.readFileSync(file)).quotaAuto, false);
+  assert.ok(JSON.parse(run('status').stdout).quotaHint.includes('quota-auto-on'));
+  delete config.quotaAuto; fs.writeFileSync(file, JSON.stringify(config));
+  assert.equal(run('init').status, 0);
+  config = JSON.parse(fs.readFileSync(file));
+  assert.equal(config.quotaAuto, true); assert.equal(config.sync, true);
+  assert.ok(!fs.existsSync(path.join(state, 'quota.json')), '初始化不主动连接账号');
 });
